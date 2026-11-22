@@ -1,0 +1,47 @@
+{
+  "Valen di Corvobianco": {
+    "id": "valen_default",
+    "nome": "Valen di Corvobianco",
+    "classe": "Guerriero",
+    "livello": 1,
+    "allineamento": "Legale",
+    "pf_attuali": 6,
+    "pf_max": 8,
+    "ca": 3,
+    "caratteristiche": {
+      "FOR": 15,
+      "INT": 9,
+      "SAG": 10,
+      "DES": 13,
+      "COS": 14,
+      "CAR": 11
+    },
+    "ts": "Morte/Veleno 12 | Bacchette 13 | Paralisi 14 | Soffio 15 | Incantesimi 16",
+    "attacco": "THAC0 19 -> CA 9: 9+ | CA 7: 11+ | CA 5: 13+ | CA 3: 15+ | CA 0: 18+ | CA -2: 20+",
+    "privilegi": "Maestria in tutte le armi e armature.",
+    "equip": [
+      "Spada Lunga (1d8+1)",
+      "Pugnale (1d4+1)",
+      "Arco Corto (1d6)",
+      "20 Frecce",
+      "Corazza di Maglia",
+      "Scudo",
+      "Zaino",
+      "6 Torce",
+      "Acciarino",
+      "7 Razioni",
+      "Otre",
+      "Corda 15m",
+      "Pertica 3m"
+    ],
+    "mo": 58,
+    "pe": 79,
+    "avventure_completate": 0,
+    "forza": 15,
+    "intelligenza": 9,
+    "saggezza": 10,
+    "destrezza": 13,
+    "costituzione": 14,
+    "carisma": 11
+  }
+}

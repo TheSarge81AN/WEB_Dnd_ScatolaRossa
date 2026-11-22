@@ -1,0 +1,28 @@
+# Credenziali e chiavi segrete
+.gemini_api_key
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database SQLite locale (generato automaticamente al primo avvio da avventure_dnd.json)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Hash di sincronizzazione manuale
+.manuale_hash
+*.tmp
+
+# Esportazioni di gioco generate a runtime (mantenute le cartelle)
+cronache/*
+!cronache/.gitkeep
+mappe/*
+!mappe/.gitkeep
+schede/*
+!schede/.gitkeep
+
+# Configurazioni IDE personali
+.vscode/
