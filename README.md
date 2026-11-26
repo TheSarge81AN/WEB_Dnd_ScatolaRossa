@@ -74,20 +74,23 @@ Il server apre `http://127.0.0.1:8765`; accedi con l'account amministratore oppu
 python dnd_web.py LA_TUA_CHIAVE_API
 ```
 
-L'interfaccia web sostituisce il menu e gli input della console per le operazioni principali:
+L'interfaccia web sostituisce il menu e gli input della console per le operazioni principali. La pagina è servita direttamente da `dnd_web.py` (non usa Flask); l'utente può scegliere tra le palette Scatola Rossa, Foresta, Arcano e Notte dalla schermata di login o dall'intestazione. La scelta viene conservata nel browser.
 
 - login e sessione persistente nel browser; gli account sono creati dall'amministratore;
 - gestione amministrativa degli account (JSON locale o tabella PostgreSQL remota) e della chiave Gemini;
-- creazione di personaggi associati al proprio account;
+- creazione ed eliminazione dei personaggi associati al proprio account; l'eliminazione li rimuove dai party delle avventure, ma è bloccata se sono l'ultimo personaggio di un'avventura;
 - creazione di avventure e join alle sessioni esistenti usando un proprio personaggio;
 - selezione ed eliminazione delle avventure create dal proprio account;
 - sidebar con riepilogo partita, richiudibile su schermi mobili;
-- pulsante zaino per consultare l'inventario dei membri del party e helper dei comandi web;
+- pulsante zaino per consultare l'inventario dei membri del party e helper dei comandi web; i risultati dei comandi slash sono mostrati nel drawer;
+- pagina Cimitero degli Eroi con personaggi a 0 PF o contrassegnati come deceduti, indicazione dell'avventura in cui sono caduti, non selezionabili per nuove avventure o per unirsi a sessioni;
+- comando amministrativo per eliminare tutte le avventure, comprese quelle iniziali o senza proprietario, previa conferma;
 - scelta dei moduli in `moduli_pdf/`;
 - invio delle azioni al DM;
-- consultazione del party e della cronaca.
+- consultazione della cronaca, automaticamente suddivisa in pagine da circa 60 righe quando è lunga;
+- icona dei dadi in fondo alle richieste di tiro del Master, con apertura in popup.
 
-I comandi `/...` possono essere inviati dalla casella azione della pagina. In modalità locale il file utenti viene inizializzato con `{"users": []}` e aggiornato dal pannello; in modalità PostgreSQL i dati account sono memorizzati nella tabella `web_users`. In entrambi i casi sono conservati salt e hash scrypt, mai password in chiaro. Crea o reimposta le password dal pannello amministrativo.
+I comandi `/...` possono essere inviati dalla casella azione della pagina; i relativi risultati vengono aperti nel drawer, come l'inventario. I personaggi con PF attuali pari o inferiori a zero vengono storicizzati come deceduti e mostrati nel Cimitero; non possono più giocare né essere selezionati per avviare o unirsi a un'avventura. Dalla pagina Amministrazione è possibile eliminare tutte le avventure con un'azione esplicita e irreversibile. In modalità locale il file utenti viene inizializzato con `{"users": []}` e aggiornato dal pannello; in modalità PostgreSQL i dati account sono memorizzati nella tabella `web_users`. In entrambi i casi sono conservati salt e hash scrypt, mai password in chiaro. Crea o reimposta le password dal pannello amministrativo.
 
 ### Pubblicazione su Render
 

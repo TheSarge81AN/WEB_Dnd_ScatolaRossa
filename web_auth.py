@@ -52,6 +52,13 @@ class WebAuthStore:
 					PRIMARY KEY (adventure_id, user_id),
 					FOREIGN KEY (user_id) REFERENCES web_users(id) ON DELETE CASCADE
 				);
+				CREATE TABLE IF NOT EXISTS web_adventure_member_characters (
+					adventure_id TEXT NOT NULL,
+					user_id INTEGER NOT NULL,
+					character_name TEXT NOT NULL,
+					PRIMARY KEY (adventure_id, user_id),
+					FOREIGN KEY (user_id) REFERENCES web_users(id) ON DELETE CASCADE
+				);
 				CREATE TABLE IF NOT EXISTS web_adventure_owners (
 					adventure_id TEXT PRIMARY KEY,
 					user_id INTEGER NOT NULL,
@@ -387,6 +394,13 @@ class WebAuthStore:
 			).fetchall()
 		return {row["character_name"] for row in rows}
 
+	def release_character(self, user_id, character_name):
+		with self._connect() as conn:
+			conn.execute(
+				"DELETE FROM web_character_owners WHERE user_id = ? AND character_name = ? COLLATE NOCASE",
+				(user_id, character_name)
+			)
+
 	def add_member(self, user_id, adventure_id):
 		with self._connect() as conn:
 			conn.execute(
@@ -402,6 +416,22 @@ class WebAuthStore:
 			).fetchone()
 		return row is not None
 
+	def set_member_character(self, user_id, adventure_id, character_name):
+		with self._connect() as conn:
+			conn.execute(
+				"INSERT INTO web_adventure_member_characters (adventure_id, user_id, character_name) VALUES (?, ?, ?) "
+				"ON CONFLICT(adventure_id, user_id) DO UPDATE SET character_name = excluded.character_name",
+				(adventure_id, user_id, character_name)
+			)
+
+	def member_character(self, user_id, adventure_id):
+		with self._connect() as conn:
+			row = conn.execute(
+				"SELECT character_name FROM web_adventure_member_characters WHERE adventure_id = ? AND user_id = ?",
+				(adventure_id, user_id)
+			).fetchone()
+		return row["character_name"] if row else None
+
 	def member_names(self, adventure_id):
 		with self._connect() as conn:
 			rows = conn.execute("""
@@ -410,6 +440,11 @@ class WebAuthStore:
 				WHERE m.adventure_id = ? ORDER BY u.username COLLATE NOCASE
 			""", (adventure_id,)).fetchall()
 		return [row["username"] for row in rows]
+
+	def remove_member(self, user_id, adventure_id):
+		with self._connect() as conn:
+			conn.execute("DELETE FROM web_adventure_member_characters WHERE adventure_id = ? AND user_id = ?", (adventure_id, user_id))
+			conn.execute("DELETE FROM web_adventure_members WHERE adventure_id = ? AND user_id = ?", (adventure_id, user_id))
 
 	def add_adventure_owner(self, user_id, adventure_id):
 		with self._connect() as conn:
@@ -428,5 +463,6 @@ class WebAuthStore:
 
 	def remove_adventure(self, adventure_id):
 		with self._connect() as conn:
+			conn.execute("DELETE FROM web_adventure_member_characters WHERE adventure_id = ?", (adventure_id,))
 			conn.execute("DELETE FROM web_adventure_members WHERE adventure_id = ?", (adventure_id,))
 			conn.execute("DELETE FROM web_adventure_owners WHERE adventure_id = ?", (adventure_id,))

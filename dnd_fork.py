@@ -266,6 +266,8 @@ class DnDDatabase:
                     carisma INTEGER NOT NULL,
                     pf_attuali INTEGER NOT NULL,
                     pf_max INTEGER NOT NULL,
+                    deceduto INTEGER NOT NULL DEFAULT 0,
+                    avventura_morte TEXT NOT NULL DEFAULT '',
                     ca INTEGER NOT NULL,
                     mo INTEGER NOT NULL DEFAULT 15,
                     pe INTEGER NOT NULL DEFAULT 0,
@@ -323,9 +325,15 @@ class DnDDatabase:
                 self.conn.execute("ALTER TABLE personaggi ADD COLUMN razza TEXT NOT NULL DEFAULT 'Umano'")
             if "incantesimi_json" not in cols_pg:
                 self.conn.execute("ALTER TABLE personaggi ADD COLUMN incantesimi_json TEXT DEFAULT '{}'")
+            if "deceduto" not in cols_pg:
+                self.conn.execute("ALTER TABLE personaggi ADD COLUMN deceduto INTEGER NOT NULL DEFAULT 0")
+            if "avventura_morte" not in cols_pg:
+                self.conn.execute("ALTER TABLE personaggi ADD COLUMN avventura_morte TEXT NOT NULL DEFAULT ''")
+            self.conn.execute("UPDATE personaggi SET deceduto = 1 WHERE pf_attuali <= 0 AND deceduto = 0")
 
     def salva_personaggio(self, eroe: dict):
         sincronizza_statistiche_becmi(eroe)
+        eroe["deceduto"] = bool(eroe.get("deceduto", False) or int(eroe["pf_attuali"]) <= 0)
         inc_json = json.dumps({
             "memorizzati": eroe.get("incantesimi_memorizzati", []),
             "usati": eroe.get("slot_usati", {})
@@ -339,14 +347,14 @@ class DnDDatabase:
                     UPDATE personaggi SET
                         classe = ?, razza = ?, livello = ?, allineamento = ?, immortale = ?,
                         forza = ?, intelligenza = ?, saggezza = ?, destrezza = ?,
-                        costituzione = ?, carisma = ?, pf_attuali = ?, pf_max = ?,
+                        costituzione = ?, carisma = ?, pf_attuali = ?, pf_max = ?, deceduto = ?, avventura_morte = ?,
                         ca = ?, mo = ?, pe = ?, ts = ?, attacco = ?,
                         abilita_classe = ?, fascia_becmi = ?, incantesimi_json = ?
                     WHERE id = ?
                 """, (
                     eroe["classe"], eroe.get("razza", "Umano"), int(eroe["livello"]), eroe["allineamento"], int(bool(eroe.get("immortale", False))),
                     int(eroe["forza"]), int(eroe["intelligenza"]), int(eroe["saggezza"]), int(eroe["destrezza"]),
-                    int(eroe["costituzione"]), int(eroe["carisma"]), int(eroe["pf_attuali"]), int(eroe["pf_max"]),
+                    int(eroe["costituzione"]), int(eroe["carisma"]), int(eroe["pf_attuali"]), int(eroe["pf_max"]), int(eroe["deceduto"]), eroe.get("avventura_morte", ""),
                     int(eroe["ca"]), int(eroe["mo"]), int(eroe["pe"]),
                     eroe.get("ts", ""), eroe.get("attacco", ""), eroe.get("abilita_classe", ""), eroe.get("fascia_becmi", ""),
                     inc_json, pg_id
@@ -356,12 +364,12 @@ class DnDDatabase:
                     INSERT INTO personaggi (
                         nome, classe, razza, livello, allineamento, immortale,
                         forza, intelligenza, saggezza, destrezza, costituzione, carisma,
-                        pf_attuali, pf_max, ca, mo, pe, ts, attacco, abilita_classe, fascia_becmi, incantesimi_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        pf_attuali, pf_max, deceduto, avventura_morte, ca, mo, pe, ts, attacco, abilita_classe, fascia_becmi, incantesimi_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     eroe["nome"], eroe["classe"], eroe.get("razza", "Umano"), int(eroe["livello"]), eroe["allineamento"], int(bool(eroe.get("immortale", False))),
                     int(eroe["forza"]), int(eroe["intelligenza"]), int(eroe["saggezza"]), int(eroe["destrezza"]),
-                    int(eroe["costituzione"]), int(eroe["carisma"]), int(eroe["pf_attuali"]), int(eroe["pf_max"]),
+                    int(eroe["costituzione"]), int(eroe["carisma"]), int(eroe["pf_attuali"]), int(eroe["pf_max"]), int(eroe["deceduto"]), eroe.get("avventura_morte", ""),
                     int(eroe["ca"]), int(eroe["mo"]), int(eroe["pe"]),
                     eroe.get("ts", ""), eroe.get("attacco", ""), eroe.get("abilita_classe", ""), eroe.get("fascia_becmi", ""),
                     inc_json
@@ -376,12 +384,19 @@ class DnDDatabase:
                     [(pg_id, str(item)) for item in equip_list]
                 )
 
+    def elimina_personaggio(self, nome: str):
+        with self.conn:
+            self.conn.execute("DELETE FROM inventario WHERE personaggio_id = (SELECT id FROM personaggi WHERE nome = ?)", (nome,))
+            self.conn.execute("DELETE FROM personaggi WHERE nome = ?", (nome,))
+
     def carica_tutti_personaggi(self) -> dict:
         personaggi = {}
         cur = self.conn.execute("SELECT * FROM personaggi ORDER BY id ASC")
         for r in cur.fetchall():
             pg = dict(r)
             pg["immortale"] = bool(pg["immortale"])
+            pg["deceduto"] = bool(pg.get("deceduto", False) or pg["pf_attuali"] <= 0)
+            pg["avventura_morte"] = pg.get("avventura_morte", "")
             inv_cur = self.conn.execute("SELECT oggetto FROM inventario WHERE personaggio_id = ? ORDER BY id ASC", (pg["id"],))
             pg["equip"] = [ir["oggetto"] for ir in inv_cur.fetchall()]
             try:

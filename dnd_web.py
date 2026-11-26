@@ -11,7 +11,7 @@ import tempfile
 import threading
 import uuid
 import webbrowser
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import datetime
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -150,6 +150,8 @@ def character_view(character):
         "razza": character.get("razza", "Umano"),
         "livello": character["livello"],
         "allineamento": character["allineamento"],
+        "deceduto": bool(character.get("deceduto", False) or character["pf_attuali"] <= 0),
+        "avventura_morte": character.get("avventura_morte", ""),
         "pf_attuali": character["pf_attuali"],
         "pf_max": character["pf_max"],
         "ca": character["ca"],
@@ -293,6 +295,19 @@ def perform_action(adventure_id, action, user):
             return 404, {"error": "Avventura non trovata."}
         if not AUTH_STORE.is_member(user["id"], adventure_id):
             return 403, {"error": "Unisciti all'avventura prima di inviare azioni."}
+        party_names = adventure.get("party") or [adventure.get("eroe", "Valen di Corvobianco")]
+        character_name = AUTH_STORE.member_character(user["id"], adventure_id)
+        owned_names = {name.casefold() for name in AUTH_STORE.character_names(user["id"])}
+        party_names_normalized = {name.casefold() for name in party_names}
+        if not character_name or character_name.casefold() not in owned_names or character_name.casefold() not in party_names_normalized:
+            character_name = next((name for name in party_names if name.casefold() in owned_names), None)
+            if not character_name:
+                return 409, {"error": "Non è possibile identificare il tuo personaggio in questa avventura. Contatta il proprietario della sessione."}
+            AUTH_STORE.set_member_character(user["id"], adventure_id, character_name)
+
+        selected_character = characters.get(character_name)
+        if not selected_character or selected_character.get("deceduto") or selected_character["pf_attuali"] <= 0:
+            return 403, {"error": "Questo personaggio è nel cimitero e non può più giocare."}
 
         with LOCK:
             slash, slash_output = execute_slash(adventure, party, action)
@@ -316,7 +331,7 @@ def perform_action(adventure_id, action, user):
         if adventure.get("buio_totale"):
             action += "\n[STATO AMBIENTALE: BUIO TOTALE.]"
 
-        action = f"[{user['username']}] {action}"
+        action = f"[{character_name}] {action}"
         adventure["storia"].append({"role": "user", "parts": [{"text": action}]})
         with LOCK:
             DB.aggiungi_messaggio(adventure_id, "user", action)
@@ -330,7 +345,14 @@ def perform_action(adventure_id, action, user):
             desc_attesa="sta valutando la scena",
         )
         adventure["storia"].append({"role": "model", "parts": [{"text": response}]})
+        previously_alive = {
+            hero["nome"]: not hero.get("deceduto", False) and hero["pf_attuali"] > 0
+            for hero in party
+        }
         game.aggiorna_party_da_riquadro(party, response)
+        for hero in party:
+            if previously_alive[hero["nome"]] and (hero.get("deceduto") or hero["pf_attuali"] <= 0):
+                hero["avventura_morte"] = adventure["titolo"]
         with LOCK:
             for hero in party:
                 DB.salva_personaggio(hero)
@@ -437,11 +459,25 @@ class WebHandler(BaseHTTPRequestHandler):
                 view["can_delete"] = AUTH_STORE.is_adventure_owner(self.current_user["id"], adventure["id"])
                 view["members"] = AUTH_STORE.member_names(adventure["id"])
                 adventure_data.append(view)
+            cemetery = []
+            for character in characters.values():
+                if not (character.get("deceduto") or character["pf_attuali"] <= 0):
+                    continue
+                view = character_view(character)
+                if not view["avventura_morte"]:
+                    party_adventures = [
+                        adventure["titolo"] for adventure in adventures.values()
+                        if any(name.casefold() == character["nome"].casefold() for name in (adventure.get("party") or [adventure.get("eroe", "")]))
+                    ]
+                    view["avventura_morte"] = party_adventures[-1] if party_adventures else "Avventura non registrata"
+                cemetery.append(view)
             json_response(self, 200, {
                 "user": self.current_user,
                 "adventures": adventure_data,
                 "characters": [character_view(v) for v in characters.values()],
-                "my_characters": [character_view(characters[name]) for name in owned_names if name in characters],
+                "owned_characters": [character_view(characters[name]) for name in owned_names if name in characters],
+                "my_characters": [character_view(characters[name]) for name in owned_names if name in characters and not characters[name].get("deceduto") and characters[name]["pf_attuali"] > 0],
+                "cemetery": cemetery,
                 "classes": [
                     {"key": k, "nome": v["classe"], "livello_max": v["max_liv"]}
                     for k, v in game.CLASSI_BASE.items() if k not in CLASSI_RAZZA_BECMI
@@ -490,6 +526,15 @@ class WebHandler(BaseHTTPRequestHandler):
                         return
                     json_response(self, 200, {"ok": True, "users": AUTH_STORE.list_users()})
                     return
+                if path == "/api/admin/cleanup-adventures":
+                    adventure_ids = list(safe_adventures())
+                    for adventure_id in adventure_ids:
+                        with adventure_lock_for(adventure_id):
+                            with LOCK:
+                                DB.elimina_avventura(adventure_id)
+                                AUTH_STORE.remove_adventure(adventure_id)
+                    json_response(self, 200, {"ok": True, "deleted": len(adventure_ids)})
+                    return
                 if path == "/api/admin/api-key":
                     api_key = str(data.get("api_key", "")).strip()
                     if len(api_key) > 2048:
@@ -513,6 +558,67 @@ class WebHandler(BaseHTTPRequestHandler):
             if not self.require_auth():
                 return
             user = self.current_user
+
+            if path == "/api/character/delete":
+                requested_name = str(data.get("character", "")).strip()
+                if not requested_name or not AUTH_STORE.owns_character(user["id"], requested_name):
+                    json_response(self, 403, {"error": "Puoi eliminare solo un tuo personaggio."})
+                    return
+                with LOCK:
+                    characters = safe_characters()
+                    character_name = next((name for name in characters if name.casefold() == requested_name.casefold()), None)
+                    adventures = safe_adventures()
+                    affected_ids = [
+                        adventure_id for adventure_id, adventure in adventures.items()
+                        if any(name.casefold() == requested_name.casefold() for name in (adventure.get("party") or [adventure.get("eroe", "")]))
+                    ]
+                if not character_name:
+                    json_response(self, 404, {"error": "Personaggio non trovato."})
+                    return
+                with ExitStack() as locks:
+                    for adventure_id in sorted(affected_ids):
+                        locks.enter_context(adventure_lock_for(adventure_id))
+                    with LOCK:
+                        adventures = safe_adventures()
+                        current_ids = [
+                            adventure_id for adventure_id, adventure in adventures.items()
+                            if any(name.casefold() == character_name.casefold() for name in (adventure.get("party") or [adventure.get("eroe", "")]))
+                        ]
+                        if any(adventure_id not in affected_ids for adventure_id in current_ids):
+                            json_response(self, 409, {"error": "Il personaggio è stato assegnato a una nuova avventura. Riprova."})
+                            return
+                        updated_parties = {}
+                        for adventure_id in current_ids:
+                            adventure = adventures[adventure_id]
+                            party_names = adventure.get("party") or [adventure.get("eroe", "")]
+                            remaining = [name for name in party_names if name.casefold() != character_name.casefold()]
+                            if not remaining:
+                                json_response(self, 409, {"error": "Non puoi eliminare l'ultimo personaggio di un'avventura. Elimina prima l'avventura."})
+                                return
+                            updated_parties[adventure_id] = remaining
+                        owned_names = {name.casefold() for name in AUTH_STORE.character_names(user["id"])}
+                        owned_names.discard(character_name.casefold())
+                        for adventure_id, party_names in updated_parties.items():
+                            adventure = adventures[adventure_id]
+                            adventure["party"] = party_names
+                            adventure["eroe"] = party_names[0]
+                            DB.salva_metadati_avventura(adventure)
+                            if AUTH_STORE.is_member(user["id"], adventure_id):
+                                replacement = next((
+                                    name for name in party_names
+                                    if name.casefold() in owned_names
+                                    and name in characters
+                                    and not characters[name].get("deceduto")
+                                    and characters[name]["pf_attuali"] > 0
+                                ), None)
+                                if replacement:
+                                    AUTH_STORE.set_member_character(user["id"], adventure_id, replacement)
+                                else:
+                                    AUTH_STORE.remove_member(user["id"], adventure_id)
+                        DB.elimina_personaggio(character_name)
+                        AUTH_STORE.release_character(user["id"], character_name)
+                json_response(self, 200, {"ok": True, "character": character_name})
+                return
 
             if path == "/api/character":
                 name = str(data.get("nome", "")).strip()
@@ -541,6 +647,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     "livello": level,
                     "allineamento": alignment,
                     "immortale": False,
+                    "deceduto": False,
                     "forza": base["forza"],
                     "intelligenza": base["intelligenza"],
                     "saggezza": base["saggezza"],
@@ -584,6 +691,9 @@ class WebHandler(BaseHTTPRequestHandler):
                     if not character:
                         json_response(self, 404, {"error": "Personaggio non trovato."})
                         return
+                    if characters[character].get("deceduto") or characters[character]["pf_attuali"] <= 0:
+                        json_response(self, 403, {"error": "Questo personaggio è nel cimitero e non può unirsi a una sessione."})
+                        return
                     if any(name.lower() == character.lower() for name in adventure.get("party", [])):
                         json_response(self, 409, {"error": "Questo personaggio è già nel party."})
                         return
@@ -592,6 +702,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     with LOCK:
                         DB.salva_metadati_avventura(adventure)
                     AUTH_STORE.add_member(user["id"], adventure_id)
+                    AUTH_STORE.set_member_character(user["id"], adventure_id, character)
                 json_response(self, 200, {"ok": True, "adventure": adventure_view(adventure)})
                 return
 
@@ -607,6 +718,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 owned_names = AUTH_STORE.character_names(user["id"])
                 if any(name not in characters or name not in owned_names for name in party_names):
                     json_response(self, 403, {"error": "Puoi avviare un'avventura solo con i tuoi personaggi."})
+                    return
+                if any(characters[name].get("deceduto") or characters[name]["pf_attuali"] <= 0 for name in party_names):
+                    json_response(self, 403, {"error": "Un personaggio nel cimitero non può partecipare a una nuova avventura."})
                     return
 
                 key = api_key_active()
@@ -671,6 +785,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     DB.aggiungi_messaggio(adventure_id, "user", prompt)
                     DB.aggiungi_messaggio(adventure_id, "model", response)
                     AUTH_STORE.add_member(user["id"], adventure_id)
+                    AUTH_STORE.set_member_character(user["id"], adventure_id, party_names[0])
                     AUTH_STORE.add_adventure_owner(user["id"], adventure_id)
                 json_response(self, 200, {"ok": True, "adventure": adventure_view(adventure)})
                 return
@@ -720,52 +835,110 @@ PAGE = r"""<!doctype html>
   <link rel="manifest" href="/app.webmanifest">
   <title>D&D - Scatola Rossa</title>
   <style>
-    :root { --red:#9c1c20; --gold:#d5ad55; --ink:#191512; --paper:#efe6cf; --panel:#fffaf0; --green:#4a6944; }
+    :root {
+      color-scheme:light;
+      --red:#9c1c20; --gold:#d5ad55; --ink:#191512; --paper:#efe6cf; --panel:#fffaf0; --green:#4a6944;
+      --app-bg:#17130f; --header-start:#321313; --header-text:#fff; --status:#f4dda0;
+      --line:#baaa88; --panel-border:#b7a778; --panel-heading-border:#d5cba8;
+      --button-bg:#a83336; --button-border:#7c2626; --button-text:#fff;
+      --secondary-bg:#eee3c5; --secondary-text:#351818; --input-bg:#fffdf7;
+      --active-bg:#eadba9; --chat-bg:#faf6e9; --user-message-bg:#f0ead8; --model-message-bg:#fff;
+      --composer-bg:#e9dfc2; --muted:#756d5a; --label:#5d5138; --subtle-border:#bbaa82;
+      --card-shadow:0 8px 24px #0002; --focus-ring:#9c1c2055;
+    }
+    body[data-palette="forest"] {
+      --red:#24664f; --gold:#c3a568; --ink:#19251f; --paper:#e5eee7; --panel:#fbfdfb; --green:#397354;
+      --app-bg:#101a15; --header-start:#142b22; --status:#e4efcf; --line:#a9bcae; --panel-border:#b7c8ba;
+      --panel-heading-border:#d5e0d6; --button-bg:#31785c; --button-border:#225b43; --secondary-bg:#e1eadc;
+      --secondary-text:#193b2d; --input-bg:#fbfdfb; --active-bg:#d4e5cf; --chat-bg:#f2f7f1;
+      --user-message-bg:#e4eee2; --composer-bg:#e3ebe1; --label:#455b4c; --subtle-border:#b1c6b5;
+      --focus-ring:#24664f55;
+    }
+    body[data-palette="arcane"] {
+      --red:#68469b; --gold:#c4a4e0; --ink:#211b2b; --paper:#eee8f5; --panel:#fcfaff; --green:#55755c;
+      --app-bg:#181322; --header-start:#2c1e42; --status:#eee0ff; --line:#c2b5d2; --panel-border:#c9bad9;
+      --panel-heading-border:#e1d7ec; --button-bg:#7653a7; --button-border:#56377f; --secondary-bg:#e9dff2;
+      --secondary-text:#35264a; --input-bg:#fdfbff; --active-bg:#e5d8f2; --chat-bg:#f8f5fb;
+      --user-message-bg:#eee8f4; --composer-bg:#e9e1ef; --label:#5b5068; --subtle-border:#cdbde0;
+      --focus-ring:#68469b55;
+    }
+    body[data-palette="midnight"] {
+      color-scheme:dark;
+      --red:#75b5d5; --gold:#d0ad72; --ink:#e7edf3; --paper:#202a35; --panel:#283542; --green:#8ebd91;
+      --app-bg:#111820; --header-start:#151e29; --status:#e4cf9f; --line:#455563; --panel-border:#485b6c;
+      --panel-heading-border:#40505f; --button-bg:#386b88; --button-border:#294f66; --button-text:#fff;
+      --secondary-bg:#33414d; --secondary-text:#e7edf3; --input-bg:#18222c; --active-bg:#344957;
+      --chat-bg:#18222c; --user-message-bg:#273541; --model-message-bg:#222e39; --composer-bg:#202c37;
+      --muted:#b0bdc9; --label:#c0ccd6; --subtle-border:#455563; --focus-ring:#75b5d555;
+    }
     * { box-sizing:border-box; }
-    body { margin:0; background:#17130f; color:var(--ink); font-family:Georgia, "Times New Roman", serif; }
-    #gameView[hidden], #loginView[hidden], #adminView[hidden] { display:none; }
-    .login-view { min-height:100vh; display:grid; place-items:center; padding:20px; background:radial-gradient(ellipse at top,#492020,#17130f 70%); }
-
-    .login-card { width:min(420px,100%); padding:28px; background:var(--paper); border:2px solid var(--gold); border-radius:6px; box-shadow:0 16px 48px #0008; }
-    .login-card h1 { margin:0 0 8px; color:var(--red); text-align:center; }
-    .login-card p { color:#5d5138; line-height:1.45; }
+    body { margin:0; background:var(--app-bg); color:var(--ink); font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; transition:background-color .2s ease,color .2s ease; }
+    #gameView[hidden], #loginView[hidden], #adminView[hidden], #cemeteryView[hidden] { display:none; }
+    .login-view { min-height:100vh; display:grid; place-items:center; padding:20px; background:radial-gradient(ellipse at top,var(--red),var(--app-bg) 70%); }
+    .login-card { width:min(440px,100%); padding:32px; background:var(--paper); border:1px solid var(--gold); border-radius:18px; box-shadow:0 24px 64px #0005; }
+    .login-card h1 { margin:0 0 8px; color:var(--red); text-align:center; letter-spacing:-.04em; }
+    .login-card p { color:var(--label); line-height:1.55; }
     .login-card .login-actions { display:flex; gap:8px; margin-top:16px; }
     .login-card .login-actions button { flex:1; }
     #loginMessage { min-height:20px; color:var(--red); }
-    header { height:58px; display:flex; align-items:center; justify-content:space-between; padding:0 20px;
-      background:linear-gradient(90deg,#321313,var(--red)); color:white; border-bottom:3px solid var(--gold); }
-    header h1 { margin:0; font-size:21px; letter-spacing:.5px; }
-    header .status { font-size:13px; color:#f4dda0; }
-    main { height:calc(100vh - 58px); display:grid; grid-template-columns:280px minmax(0, 1fr); }
+    header { min-height:64px; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:8px 20px;
+      background:linear-gradient(110deg,var(--header-start),var(--red)); color:var(--header-text); border-bottom:1px solid var(--gold); box-shadow:0 4px 16px #0002; }
+    header h1 { margin:0; font-size:20px; letter-spacing:-.03em; }
+    header .status { font-size:13px; color:var(--status); }
+    .header-actions { display:flex; align-items:center; gap:12px; }
+    .palette-control { display:flex; align-items:center; gap:8px; }
+    .palette-control label { margin:0; color:var(--status); font-size:12px; white-space:nowrap; }
+    .palette-control select { width:auto; min-width:138px; padding:7px 28px 7px 10px; border:1px solid #ffffff55; border-radius:9px; background:var(--paper); color:var(--ink); font-size:13px; }
+    .login-palette-control { justify-content:center; margin-top:22px; }
+    .login-palette-control label { color:var(--label); font-size:13px; }
+    .login-palette-control select { border-color:var(--panel-border); }
+    #busyIndicator[hidden] { display:none; }
+    .busy-indicator { display:inline-flex; align-items:center; font-size:21px; line-height:1; }
+    .busy-indicator[aria-hidden="false"] { animation: hourglass-turn 1.2s ease-in-out infinite; }
+    @keyframes hourglass-turn { 50% { transform:rotate(180deg); } }
+    #databaseSavingIndicator[hidden] { display:none; }
+    .database-saving-indicator { position:fixed; z-index:40; left:18px; bottom:18px; display:grid; place-items:center; width:44px; height:44px; padding:8px; color:var(--red); background:var(--paper); border:2px solid var(--gold); border-radius:14px; box-shadow:var(--card-shadow); }
+    .database-saving-indicator[aria-hidden="false"] { animation: database-saving-pulse 1s ease-in-out infinite alternate; }
+    .database-saving-indicator svg { width:24px; height:24px; }
+    @keyframes database-saving-pulse { to { transform:scale(1.12); } }
+    @media (prefers-reduced-motion: reduce) { .busy-indicator[aria-hidden="false"], .database-saving-indicator[aria-hidden="false"] { animation:none; } }
+    main { height:calc(100vh - 64px); display:grid; grid-template-columns:292px minmax(0, 1fr); }
     aside, section { min-height:0; }
-    aside { background:var(--paper); border-right:1px solid #baaa88; overflow:auto; padding:14px; }
+    aside { background:var(--paper); border-right:1px solid var(--line); overflow:auto; padding:16px; }
     #sidebarToggle { display:none; }
     #sidebarBackdrop { display:none; }
-    .panel { background:var(--panel); border:1px solid #b7a778; border-radius:4px; padding:12px; margin-bottom:12px; }
-    .panel h2 { margin:0 0 10px; color:var(--red); font-size:16px; border-bottom:1px solid #d5cba8; padding-bottom:6px; }
+    .panel { background:var(--panel); border:1px solid var(--panel-border); border-radius:14px; padding:14px; margin-bottom:14px; box-shadow:var(--card-shadow); }
+    .panel h2 { margin:0 0 12px; color:var(--red); font-size:15px; border-bottom:1px solid var(--panel-heading-border); padding-bottom:8px; letter-spacing:.01em; }
     button, select, input, textarea { font:inherit; }
-    button { border:1px solid #7c2626; background:#a83336; color:white; border-radius:3px; padding:7px 10px; cursor:pointer; }
-    button.secondary { background:#eee3c5; color:#351818; border-color:#99865f; }
+    button { border:1px solid var(--button-border); background:var(--button-bg); color:var(--button-text); border-radius:9px; padding:9px 13px; cursor:pointer; font-weight:600; transition:transform .15s ease,filter .15s ease,box-shadow .15s ease; }
+    button:hover:not(:disabled) { filter:brightness(1.06); transform:translateY(-1px); box-shadow:0 4px 12px #0002; }
+    button.secondary { background:var(--secondary-bg); color:var(--secondary-text); border-color:var(--panel-border); }
     button.danger { background:#65201f; }
     button:disabled { opacity:.55; cursor:not-allowed; }
-    input, select, textarea { width:100%; border:1px solid #aa9a70; background:#fffdf7; padding:8px; border-radius:3px; }
-    label { display:block; font-size:12px; margin:7px 0 3px; color:#5d5138; }
-    .adv { width:100%; text-align:left; margin:4px 0; background:#fffdf7; color:var(--ink); border-color:#bbaa82; }
-    .adv.active { background:#eadba9; border-color:#9c1c20; }
-    .adv-wrap { display:flex; gap:4px; margin:4px 0; }
+    input, select, textarea { width:100%; border:1px solid var(--line); background:var(--input-bg); color:var(--ink); padding:10px 11px; border-radius:9px; }
+    input:focus, select:focus, textarea:focus, button:focus-visible { outline:3px solid var(--focus-ring); outline-offset:2px; }
+    label { display:block; font-size:12px; margin:8px 0 4px; color:var(--label); font-weight:600; }
+    .adv { width:100%; text-align:left; margin:4px 0; background:var(--input-bg); color:var(--ink); border-color:var(--subtle-border); }
+    .adv.active { background:var(--active-bg); border-color:var(--red); }
+    .adv-wrap { display:flex; gap:6px; margin:5px 0; }
     .adv-wrap .adv { margin:0; flex:1; }
-    .adv-delete { width:34px; padding:5px; background:#65201f; }
-    .chat { background:#faf6e9; display:flex; flex-direction:column; }
-    #messages { flex:1; overflow:auto; padding:20px 28px; }
-    .message { max-width:900px; margin:0 auto 14px; white-space:pre-wrap; line-height:1.48; }
-    .message.user { border-left:3px solid #7c8b67; padding:9px 12px; background:#f0ead8; }
-    .message.model { border-left:3px solid var(--red); padding:9px 12px; background:white; }
-    .composer { border-top:1px solid #b8a985; background:#e9dfc2; padding:12px 16px; }
-    .composer-row { display:flex; gap:8px; }
-    .composer textarea { resize:none; height:48px; }
-    .composer button { width:90px; }
-    #output { min-height:30px; padding:8px 12px 0; color:#74302e; font-size:13px; }
-    .hero { border-bottom:1px dashed #baa978; padding:7px 0; }
+    .adv-delete { width:38px; padding:5px; background:var(--button-bg); }
+    .chat { background:var(--chat-bg); display:flex; flex-direction:column; }
+    #messages { flex:1; overflow:auto; padding:24px clamp(14px,3vw,36px); scroll-behavior:smooth; }
+    .message { max-width:900px; margin:0 auto 14px; white-space:pre-wrap; line-height:1.58; }
+    .message.user { border:1px solid var(--subtle-border); border-left:4px solid var(--green); padding:12px 15px; background:var(--user-message-bg); border-radius:4px 13px 13px 13px; }
+    .message.model { border:1px solid var(--panel-heading-border); border-left:4px solid var(--red); padding:12px 15px; background:var(--model-message-bg); border-radius:4px 13px 13px 13px; box-shadow:0 3px 12px #0000000a; }
+    .message-dice-link { display:inline-grid; vertical-align:middle; place-items:center; width:36px; height:36px; margin-left:8px; padding:4px; background:var(--button-bg); border:1px solid var(--button-border); border-radius:10px; color:var(--button-text); }
+    .message-dice-link svg { width:23px; height:23px; }
+    .story-pagination { display:flex; align-items:center; justify-content:center; gap:12px; padding:8px 14px 12px; color:var(--muted); font-size:13px; }
+    .story-pagination[hidden] { display:none; }
+    .story-pagination button { min-width:90px; }
+    .composer { border-top:1px solid var(--line); background:var(--composer-bg); padding:14px 18px; }
+    .composer-row { display:flex; gap:10px; }
+    .composer textarea { resize:vertical; min-height:50px; max-height:180px; }
+    .composer button { min-width:92px; }
+    #output { min-height:30px; padding:8px 12px 0; color:var(--red); font-size:13px; }
+    .hero { border-bottom:1px dashed var(--line); padding:9px 0; }
     .hero strong { color:var(--red); }
     .party-hero-head { display:flex; align-items:center; justify-content:space-between; gap:6px; }
     .inventory-button { position:relative; z-index:32; display:grid; place-items:center; width:32px; height:30px; padding:3px; background:var(--red); border-color:#6f1115; }
@@ -776,45 +949,59 @@ PAGE = r"""<!doctype html>
     .command-help li { display:block; padding:6px 0; border-bottom:1px dashed #d5cba8; font-size:12px; }
     .command-shortcut { display:block; margin-bottom:4px; padding:3px 5px; font-family:monospace; font-size:11px; }
     #inventoryBackdrop { position:fixed; z-index:29; inset:0; background:#0008; opacity:0; pointer-events:none; transition:opacity .22s ease; }
-    #inventoryPanel { position:fixed; z-index:30; left:50%; bottom:0; width:min(720px,calc(100vw - 24px)); max-height:min(65vh,600px); overflow:auto; padding:16px; background:var(--paper); border:1px solid #b7a778; border-bottom:0; border-radius:12px 12px 0 0; box-shadow:0 -8px 28px #0005; transform:translate(-50%,calc(100% + 24px)); transition:transform .24s ease; }
+    #inventoryPanel { position:fixed; z-index:30; left:50%; bottom:0; width:min(720px,calc(100vw - 24px)); max-height:min(65vh,600px); overflow:auto; padding:18px; background:var(--paper); border:1px solid var(--panel-border); border-bottom:0; border-radius:18px 18px 0 0; box-shadow:0 -8px 28px #0005; transform:translate(-50%,calc(100% + 24px)); transition:transform .24s ease; }
     body.inventory-open #inventoryBackdrop { opacity:1; pointer-events:auto; }
     body.inventory-open #inventoryPanel { transform:translate(-50%,0); }
     body.inventory-open #sidebar { z-index:31; }
     .inventory-panel-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
     .inventory-panel-heading h2 { margin:0; color:var(--red); font-size:18px; }
-    #inventoryClose { width:34px; padding:4px; font-size:20px; line-height:1; }
-    #inventoryContent { white-space:pre-wrap; line-height:1.5; }
-    .muted { color:#756d5a; font-size:12px; }
+    #inventoryClose { width:36px; padding:4px; font-size:20px; line-height:1; }
+    #inventoryContent { white-space:pre-wrap; line-height:1.55; }
+    .muted { color:var(--muted); font-size:12px; }
     .grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-    #adminView main.admin-main { height:auto; min-height:calc(100vh - 58px); display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); align-content:start; gap:16px; padding:20px; }
-    .admin-user-row { display:flex; align-items:center; gap:8px; border-bottom:1px dashed #d5cba8; padding:8px 0; }
+    #adminView main.admin-main { height:auto; min-height:calc(100vh - 64px); display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); align-content:start; gap:16px; padding:20px; }
+    #cemeteryView main.cemetery-main { height:calc(100vh - 64px); display:block; overflow:auto; padding:clamp(16px,4vw,36px); }
+    .cemetery-heading { max-width:1100px; margin:0 auto 18px; }
+    .cemetery-heading h2 { margin:0 0 6px; color:var(--red); }
+    .cemetery-grid { max-width:1100px; margin:0 auto; display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:14px; }
+    .cemetery-card { background:var(--panel); border:1px solid var(--panel-border); border-left:4px solid var(--muted); border-radius:14px; padding:16px; box-shadow:var(--card-shadow); }
+    .cemetery-card h3 { margin:0 0 8px; color:var(--red); }
+    .cemetery-empty { max-width:1100px; margin:auto; padding:24px; text-align:center; color:var(--muted); background:var(--panel); border:1px dashed var(--panel-border); border-radius:14px; }
+    .admin-user-row { display:flex; align-items:center; gap:8px; border-bottom:1px dashed var(--panel-heading-border); padding:8px 0; }
     .admin-user-row strong { min-width:120px; }
     .admin-user-row input { min-width:100px; }
-    .admin-key-status { margin-top:10px; color:#5d5138; }
+    .admin-key-status { margin-top:10px; color:var(--label); }
+    dialog { color:var(--ink); background:var(--paper); border:1px solid var(--panel-border); border-radius:16px; box-shadow:0 24px 64px #0005; }
+    dialog::backdrop { background:#11182099; backdrop-filter:blur(3px); }
+    dialog h2 { color:var(--red); }
     .chat { min-width:0; }
     @media (max-width:900px) {
-      main { grid-template-columns:220px minmax(0, 1fr); }
+      main { grid-template-columns:240px minmax(0, 1fr); }
+      .header-actions { gap:8px; }
     }
     @media (max-width:700px) {
-      header { justify-content:flex-start; gap:10px; padding:0 12px; }
-      header h1 { font-size:17px; }
-      header .status { display:none; }
+      header { justify-content:space-between; gap:8px; padding:8px 12px; }
+      header h1 { font-size:16px; }
+      header .status, .palette-control label { display:none; }
+      .header-actions { gap:6px; }
+      .palette-control select { min-width:0; max-width:112px; padding:7px 22px 7px 7px; font-size:12px; }
       #sidebarToggle { display:inline-flex; align-items:center; justify-content:center; min-width:40px; }
-      main { display:block; height:calc(100vh - 58px); }
+      main { display:block; height:calc(100vh - 64px); }
       #adminView main.admin-main { display:block; height:auto; }
+      #cemeteryView main.cemetery-main { height:calc(100vh - 64px); }
       #sidebar {
-        position:fixed; z-index:20; top:58px; bottom:0; left:0;
-        width:min(86vw, 320px); border-right:1px solid #baaa88;
+        position:fixed; z-index:20; top:64px; bottom:0; left:0;
+        width:min(86vw, 320px); border-right:1px solid var(--line);
         box-shadow:8px 0 24px #0005; transform:translateX(-105%);
         transition:transform .22s ease;
       }
       body.sidebar-open #sidebar { transform:translateX(0); }
       #sidebarBackdrop {
-        position:fixed; z-index:19; inset:58px 0 0;
+        position:fixed; z-index:19; inset:64px 0 0;
         background:#0008;
       }
       body.sidebar-open #sidebarBackdrop { display:block; }
-      .chat { height:calc(100vh - 58px); }
+      .chat { height:calc(100vh - 64px); }
       #messages { padding:14px 12px; }
       .composer { padding:10px; }
     }
@@ -831,13 +1018,14 @@ PAGE = r"""<!doctype html>
     <input id="loginPassword" name="password" type="password" autocomplete="current-password" required>
     <p id="loginMessage" role="alert"></p>
     <div class="login-actions"><button id="loginSubmit" type="submit">Accedi</button></div>
+    <div class="palette-control login-palette-control"><label for="loginPalette">Aspetto</label><select class="palette-select" id="loginPalette" aria-label="Scegli la palette colori"><option value="red">Scatola Rossa</option><option value="forest">Foresta</option><option value="arcane">Arcano</option><option value="midnight">Notte</option></select></div>
   </form>
 </section>
 <div id="gameView" hidden>
 <header>
   <button id="sidebarToggle" type="button" aria-label="Apri il menu" aria-expanded="false">☰</button>
   <h1>D&amp;D - Scatola Rossa</h1>
-  <div style="display:flex;align-items:center;gap:12px"><div class="status" id="status">Caricamento...</div><span id="currentUser" class="status"></span><button id="adminBtn" class="secondary" type="button" hidden>Amministrazione</button><button id="logoutBtn" class="secondary" type="button">Esci</button></div>
+  <div class="header-actions"><span id="busyIndicator" class="busy-indicator" role="status" aria-label="Elaborazione in corso" aria-hidden="true" title="Elaborazione in corso" hidden>⌛</span><div class="status" id="status">Caricamento...</div><span id="currentUser" class="status"></span><div class="palette-control"><label for="gamePalette">Palette</label><select class="palette-select" id="gamePalette" aria-label="Scegli la palette colori"><option value="red">Scatola Rossa</option><option value="forest">Foresta</option><option value="arcane">Arcano</option><option value="midnight">Notte</option></select></div><button id="adminBtn" class="secondary" type="button" hidden>Amministrazione</button><button id="logoutBtn" class="secondary" type="button">Esci</button></div>
 </header>
 <div id="sidebarBackdrop"></div>
 <div id="inventoryBackdrop"></div>
@@ -862,9 +1050,15 @@ PAGE = r"""<!doctype html>
       <summary>Comandi disponibili</summary>
       <ul id="commandList"></ul>
     </details>
+    <button id="cemeteryBtn" class="secondary" type="button" style="width:100%">Cimitero degli Eroi</button>
   </aside>
   <section class="chat">
     <div id="messages"></div>
+    <nav id="storyPagination" class="story-pagination" aria-label="Pagine della cronaca" hidden>
+      <button id="storyPrevious" class="secondary" type="button" aria-label="Pagina precedente">‹ Precedente</button>
+      <span id="storyPageStatus" aria-live="polite"></span>
+      <button id="storyNext" class="secondary" type="button" aria-label="Pagina successiva">Successiva ›</button>
+    </nav>
     <div id="output"></div>
     <div class="composer">
       <div class="composer-row">
@@ -885,7 +1079,7 @@ PAGE = r"""<!doctype html>
 
 <dialog id="characterDialog">
   <form method="dialog" style="min-width:min(420px,90vw)">
-    <h2 style="color:#9c1c20">Nuovo personaggio</h2>
+    <h2>Nuovo personaggio</h2>
     <label>Nome</label><input id="charName" required>
     <label>Classe</label><select id="charClass"></select>
     <label>Razza</label><select id="charRace"></select>
@@ -900,7 +1094,7 @@ PAGE = r"""<!doctype html>
 
 <dialog id="adventureDialog">
   <form method="dialog" style="min-width:min(520px,90vw)">
-    <h2 style="color:#9c1c20">Nuova avventura</h2>
+    <h2>Nuova avventura</h2>
     <label>Titolo</label><input id="advTitle" placeholder="Opzionale">
     <label>Personaggi</label><select id="advParty" multiple size="5"></select>
     <label>Modulo PDF</label><select id="advModule"><option value="">Scenario predefinito</option></select>
@@ -914,7 +1108,7 @@ PAGE = r"""<!doctype html>
 
 <dialog id="joinDialog">
   <form method="dialog" style="min-width:min(420px,90vw)">
-    <h2 style="color:#9c1c20">Unisciti alla sessione</h2>
+    <h2>Unisciti alla sessione</h2>
     <p id="joinAdventureTitle"></p>
     <label for="joinCharacter">Personaggio da portare</label>
     <select id="joinCharacter" required></select>
@@ -944,6 +1138,12 @@ PAGE = r"""<!doctype html>
       <p id="adminUserMessage" class="admin-key-status" role="status"></p>
     </section>
     <section class="panel">
+      <h2>Manutenzione avventure</h2>
+      <p class="muted">Elimina tutte le avventure dal database, comprese quelle iniziali o prive di proprietario.</p>
+      <button id="cleanupAdventuresBtn" class="danger" type="button">Pulisci tutte le avventure</button>
+      <p id="cleanupAdventuresMessage" class="admin-key-status" role="status"></p>
+    </section>
+    <section class="panel">
       <h2>Chiave API Gemini</h2>
       <p class="muted">La chiave salvata qui ha priorità su <code>GEMINI_API_KEY</code> e viene scritta nel file locale protetto.</p>
       <label for="adminApiKey">Nuova chiave API</label>
@@ -954,10 +1154,64 @@ PAGE = r"""<!doctype html>
     </section>
   </main>
 </section>
+<section id="cemeteryView" hidden>
+  <header>
+    <h1>Cimitero degli Eroi</h1>
+    <div class="header-actions"><div class="palette-control"><label for="cemeteryPalette">Palette</label><select class="palette-select" id="cemeteryPalette" aria-label="Scegli la palette colori"><option value="red">Scatola Rossa</option><option value="forest">Foresta</option><option value="arcane">Arcano</option><option value="midnight">Notte</option></select></div><button id="cemeteryBack" class="secondary" type="button">Torna all'avventura</button><button id="cemeteryLogoutBtn" class="secondary" type="button">Esci</button></div>
+  </header>
+  <main class="cemetery-main">
+    <div class="cemetery-heading"><h2>Caduti in avventura</h2><p class="muted">I personaggi nel cimitero non possono essere scelti per nuove sessioni.</p></div>
+    <div id="cemeteryList" class="cemetery-grid"></div>
+  </main>
+</section>
+<span id="databaseSavingIndicator" class="database-saving-indicator" role="status" aria-label="Salvataggio sul database in corso" aria-live="polite" aria-hidden="true" title="Salvataggio sul database in corso" hidden><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><ellipse cx="12" cy="5" rx="8" ry="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></span>
 
 <script>
 let state = null;
 let activeId = null;
+let processingOperations = 0;
+let databaseSavingOperations = 0;
+const PALETTE_NAMES = new Set(['red', 'forest', 'arcane', 'midnight']);
+
+function applyPalette(palette, persist = true) {
+  const selected = PALETTE_NAMES.has(palette) ? palette : 'red';
+  document.body.dataset.palette = selected;
+  document.querySelectorAll('.palette-select').forEach(select => { select.value = selected; });
+  const themeColors = {red:'#9c1c20', forest:'#24664f', arcane:'#68469b', midnight:'#111820'};
+  document.querySelector('meta[name="theme-color"]').content = themeColors[selected];
+  if (persist) {
+    try {
+      localStorage.setItem('dnd_web_palette', selected);
+    } catch (error) {
+      console.warn('Impossibile salvare la palette in questo browser.', error);
+      document.getElementById('output').textContent = 'Palette applicata, ma non salvata nel browser.';
+    }
+  }
+}
+
+try {
+  applyPalette(localStorage.getItem('dnd_web_palette') || 'red', false);
+} catch (error) {
+  console.warn('Impossibile leggere la palette salvata nel browser.', error);
+  applyPalette('red', false);
+}
+document.querySelectorAll('.palette-select').forEach(select => {
+  select.addEventListener('change', () => applyPalette(select.value));
+});
+
+function setProcessing(active) {
+  processingOperations = Math.max(0, processingOperations + (active ? 1 : -1));
+  const indicator = document.getElementById('busyIndicator');
+  indicator.hidden = processingOperations === 0;
+  indicator.setAttribute('aria-hidden', String(indicator.hidden));
+}
+
+function setDatabaseSaving(active) {
+  databaseSavingOperations = Math.max(0, databaseSavingOperations + (active ? 1 : -1));
+  const indicator = document.getElementById('databaseSavingIndicator');
+  indicator.hidden = databaseSavingOperations === 0;
+  indicator.setAttribute('aria-hidden', String(indicator.hidden));
+}
 
 const WEB_COMMANDS = [
   {label:'/help', value:'/help', description:'Mostra la guida rapida.'},
@@ -980,6 +1234,14 @@ function closeSidebar() {
 }
 
 let activeInventoryName = null;
+
+function openDrawer(title, content) {
+  activeInventoryName = null;
+  document.getElementById('inventoryTitle').textContent = title;
+  document.getElementById('inventoryContent').textContent = content;
+  document.body.classList.add('inventory-open');
+  document.getElementById('inventoryPanel').setAttribute('aria-hidden', 'false');
+}
 
 function closeInventory() {
   document.body.classList.remove('inventory-open');
@@ -1027,28 +1289,43 @@ function renderCommandList() {
 renderCommandList();
 
 async function api(url, data) {
-  const res = await fetch(url, data ? {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)} : {});
-  const json = await res.json();
-  if (!res.ok) throw new Error(json.error || 'Errore');
-  return json;
+  const savesData = Boolean(data);
+  if (savesData) setDatabaseSaving(true);
+  try {
+    const res = await fetch(url, data ? {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)} : {});
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Errore');
+    return json;
+  } finally {
+    if (savesData) setDatabaseSaving(false);
+  }
 }
 
 let refreshing = false;
 let renderedAdventureId = null;
+let renderedStorySnapshot = '';
+let renderedStoryPageCount = 0;
+let storyPageIndex = 0;
+const STORY_PAGE_LINE_LIMIT = 60;
 
 function showLogin(message = '') {
   document.getElementById('gameView').hidden = true;
   document.getElementById('adminView').hidden = true;
+  document.getElementById('cemeteryView').hidden = true;
   document.getElementById('loginView').hidden = false;
   document.getElementById('loginMessage').textContent = message;
   activeId = null;
   state = null;
   renderedAdventureId = null;
+  renderedStorySnapshot = '';
+  renderedStoryPageCount = 0;
+  storyPageIndex = 0;
 }
 
 async function showGame(user) {
   document.getElementById('loginView').hidden = true;
   document.getElementById('adminView').hidden = true;
+  document.getElementById('cemeteryView').hidden = true;
   document.getElementById('gameView').hidden = false;
   document.getElementById('currentUser').textContent = user.username;
   document.getElementById('adminBtn').hidden = !user.is_admin;
@@ -1078,6 +1355,19 @@ document.getElementById('logoutBtn').onclick = async () => {
 
 document.getElementById('adminBtn').onclick = openAdmin;
 document.getElementById('adminLogoutBtn').onclick = () => document.getElementById('logoutBtn').click();
+document.getElementById('cemeteryBtn').onclick = () => {
+  closeSidebar();
+  closeInventory();
+  document.getElementById('gameView').hidden = true;
+  document.getElementById('cemeteryView').hidden = false;
+  renderCemetery();
+};
+document.getElementById('cemeteryBack').onclick = async () => {
+  document.getElementById('cemeteryView').hidden = true;
+  document.getElementById('gameView').hidden = false;
+  await refresh();
+};
+document.getElementById('cemeteryLogoutBtn').onclick = () => document.getElementById('logoutBtn').click();
 document.getElementById('adminBack').onclick = async () => {
   document.getElementById('adminView').hidden = true;
   document.getElementById('gameView').hidden = false;
@@ -1166,6 +1456,19 @@ document.getElementById('saveApiKey').onclick = async () => {
   } catch(e) { message.textContent = e.message; }
 };
 
+document.getElementById('cleanupAdventuresBtn').onclick = async () => {
+  if (!confirm('Eliminare tutte le avventure, incluse quelle iniziali e senza proprietario? Questa operazione non si può annullare.')) return;
+  const button = document.getElementById('cleanupAdventuresBtn');
+  const message = document.getElementById('cleanupAdventuresMessage');
+  button.disabled = true;
+  try {
+    const result = await api('/api/admin/cleanup-adventures', {});
+    message.textContent = `Eliminate ${result.deleted} avventure.`;
+    await refresh();
+  } catch(e) { message.textContent = e.message; }
+  finally { button.disabled = false; }
+};
+
 document.getElementById('clearApiKey').onclick = async () => {
   if (!confirm('Rimuovere la chiave API salvata sul server?')) return;
   const message = document.getElementById('adminApiKeyMessage');
@@ -1184,8 +1487,128 @@ function escapeHtml(value) {
   return div.innerHTML;
 }
 
-async function refresh() {
-  if (refreshing || document.getElementById('gameView').hidden) return;
+function renderCemetery() {
+  const cemeteryList = document.getElementById('cemeteryList');
+  if (!state?.cemetery?.length) {
+    cemeteryList.className = 'cemetery-empty';
+    cemeteryList.textContent = 'Il cimitero è vuoto.';
+    return;
+  }
+  cemeteryList.className = 'cemetery-grid';
+  const owned = new Set((state.owned_characters || []).map(character => character.nome.toLocaleLowerCase()));
+  cemeteryList.innerHTML = state.cemetery.map(character =>
+    `<article class="cemetery-card"><h3>${escapeHtml(character.nome)}</h3><div>${escapeHtml(character.classe)}${character.razza ? ` | ${escapeHtml(character.razza)}` : ''}</div><div>Livello ${character.livello} | PF ${character.pf_attuali}/${character.pf_max}</div><div>Caduto nell'avventura: ${escapeHtml(character.avventura_morte || 'Avventura non registrata')}</div><div class="muted">Personaggio non più giocabile</div>${owned.has(character.nome.toLocaleLowerCase()) ? `<button class="character-delete danger" type="button" data-character="${escapeHtml(character.nome)}" style="margin-top:10px">Elimina personaggio</button>` : ''}</article>`
+  ).join('');
+  cemeteryList.querySelectorAll('.character-delete').forEach(button => {
+    button.onclick = () => deleteCharacter(button.dataset.character);
+  });
+}
+
+async function deleteCharacter(name) {
+  if (!confirm(`Eliminare definitivamente il personaggio "${name}"?`)) return;
+  const cemeteryVisible = !document.getElementById('cemeteryView').hidden;
+  try {
+    await api('/api/character/delete', {character:name});
+    await refresh(true);
+    if (!cemeteryVisible) document.getElementById('output').textContent = `Personaggio ${name} eliminato.`;
+  } catch(e) { alert(e.message); }
+}
+
+function requestsDiceRoll(text) {
+  return /\b(?:tira(?:te)?|lancia(?:te)?|effettua(?:te)?|esegui(?:te)?|fai|fate)\b.{0,100}\b(?:dado|dadi|tiro|tiri)\b|\b(?:tira(?:te)?|lancia(?:te)?|effettua(?:te)?|esegui(?:te)?|fai|fate)\b.{0,100}(?:\d*d\d+)\b|\b(?:dado|dadi)\b.{0,60}\b(?:tira|lancia|effettua|esegui|fai|fate)\b/i.test(text);
+}
+
+function estimateStoryLines(text, container) {
+  const canvas = estimateStoryLines.canvas || (estimateStoryLines.canvas = document.createElement('canvas'));
+  const context = canvas.getContext('2d');
+  if (!context) return Math.max(1, String(text).split(/\r?\n/).length);
+  context.font = getComputedStyle(container).font;
+  const messageWidth = Math.max(1, Math.min(900, container.clientWidth - 48) - 38);
+  let lines = 0;
+  for (const paragraph of String(text).split(/\r?\n/)) {
+    if (!paragraph) { lines++; continue; }
+    let line = '';
+    for (const word of paragraph.split(/\s+/)) {
+      const candidate = line ? `${line} ${word}` : word;
+      if (line && context.measureText(candidate).width > messageWidth) {
+        lines++;
+        line = word;
+      } else {
+        line = candidate;
+      }
+    }
+    lines++;
+  }
+  return Math.max(1, lines);
+}
+
+function wrapStoryText(text, container) {
+  const canvas = estimateStoryLines.canvas || (estimateStoryLines.canvas = document.createElement('canvas'));
+  const context = canvas.getContext('2d');
+  if (!context) return String(text);
+  context.font = getComputedStyle(container).font;
+  const messageWidth = Math.max(1, Math.min(900, container.clientWidth - 48) - 38);
+  const wrappedParagraphs = String(text).split(/\r?\n/).map(paragraph => {
+    if (!paragraph) return '';
+    const lines = [];
+    let line = '';
+    for (const word of paragraph.split(/\s+/)) {
+      const candidate = line ? `${line} ${word}` : word;
+      if (line && context.measureText(candidate).width > messageWidth) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = candidate;
+      }
+      while (context.measureText(line).width > messageWidth) {
+        let splitAt = line.length - 1;
+        while (splitAt > 1 && context.measureText(line.slice(0, splitAt)).width > messageWidth) splitAt--;
+        lines.push(line.slice(0, splitAt));
+        line = line.slice(splitAt);
+      }
+    }
+    if (line) lines.push(line);
+    return lines.join('\n');
+  });
+  return wrappedParagraphs.join('\n');
+}
+
+function paginateStory(story, container) {
+  const pages = [];
+  let page = [];
+  let pageLines = 0;
+  for (const message of story) {
+    const messageLines = estimateStoryLines(message.text, container);
+    const diceRequested = message.role === 'model' && requestsDiceRoll(message.text);
+    const fragments = messageLines > STORY_PAGE_LINE_LIMIT
+      ? wrapStoryText(message.text, container).split('\n').reduce((chunks, line) => {
+          if (!chunks.length || chunks[chunks.length - 1].length >= STORY_PAGE_LINE_LIMIT) chunks.push([]);
+          chunks[chunks.length - 1].push(line);
+          return chunks;
+        }, []).map((lines, index, chunks) => ({
+          ...message,
+          text:lines.join('\n'),
+          diceRequested,
+          isFinalFragment:index === chunks.length - 1,
+        }))
+      : [{...message, diceRequested, isFinalFragment:true}];
+    for (const fragment of fragments) {
+      const fragmentLines = estimateStoryLines(fragment.text, container);
+      if (page.length && pageLines + fragmentLines > STORY_PAGE_LINE_LIMIT) {
+        pages.push(page);
+        page = [];
+        pageLines = 0;
+      }
+      page.push(fragment);
+      pageLines += fragmentLines;
+    }
+  }
+  if (page.length) pages.push(page);
+  return pages.length ? pages : [[]];
+}
+
+async function refresh(force = false) {
+  if (refreshing || (!force && document.getElementById('gameView').hidden)) return;
   refreshing = true;
   try {
     state = await api('/api/state');
@@ -1230,8 +1653,11 @@ async function refresh() {
 
   const chars = document.getElementById('characterList');
   chars.innerHTML = state.my_characters.length ? state.my_characters.map(c =>
-    `<div class="hero"><strong>${escapeHtml(c.nome)}</strong><br><span class="muted">Classe: ${escapeHtml(c.classe)} | Razza: ${escapeHtml(c.razza || 'Umano')} | Liv. ${c.livello} | PF ${c.pf_attuali}/${c.pf_max}</span></div>`
+    `<div class="hero"><div class="party-hero-head"><strong>${escapeHtml(c.nome)}</strong><button class="character-delete danger" type="button" data-character="${escapeHtml(c.nome)}" aria-label="Elimina ${escapeHtml(c.nome)}" title="Elimina personaggio">×</button></div><span class="muted">Classe: ${escapeHtml(c.classe)} | Razza: ${escapeHtml(c.razza || 'Umano')} | Liv. ${c.livello} | PF ${c.pf_attuali}/${c.pf_max}</span></div>`
   ).join('') : '<div class="muted">Crea un personaggio per partecipare.</div>';
+  chars.querySelectorAll('.character-delete').forEach(button => {
+    button.onclick = () => deleteCharacter(button.dataset.character);
+  });
 
   const classSelect = document.getElementById('charClass');
   const selectedClass = classSelect.value;
@@ -1268,6 +1694,7 @@ async function refresh() {
     activeId = state.adventures.find(a => a.joined)?.id || null;
   }
   renderActive();
+  renderCemetery();
   } finally {
     refreshing = false;
   }
@@ -1313,7 +1740,7 @@ function renderAdventureList() {
   });
 }
 
-function renderActive() {
+function renderActive(allowAutoScroll = true) {
   const adv = state?.adventures.find(a => a.id === activeId && a.joined);
   const messages = document.getElementById('messages');
   const party = document.getElementById('party');
@@ -1323,19 +1750,53 @@ function renderActive() {
     const placeholder = '<div class="message">Seleziona una sessione a cui partecipi o unisciti a una sessione disponibile.</div>';
     if (messages.innerHTML !== placeholder) messages.innerHTML = placeholder;
     renderedAdventureId = null;
+    renderedStorySnapshot = '';
+    renderedStoryPageCount = 0;
+    storyPageIndex = 0;
+    document.getElementById('storyPagination').hidden = true;
     party.innerHTML = '';
     return;
   }
   title.textContent = `${adv.titolo} — ${adv.members.join(', ') || 'nessun partecipante'}`;
-  const messageHtml = adv.storia.map(m =>
-    `<div class="message ${m.role === 'model' ? 'model' : 'user'}">${escapeHtml(m.text)}</div>`
-  ).join('');
   const wasAtBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 60;
   const adventureChanged = renderedAdventureId !== adv.id;
-  if (adventureChanged || messages.innerHTML !== messageHtml) {
+  const storySnapshot = JSON.stringify(adv.storia);
+  const storyChanged = storySnapshot !== renderedStorySnapshot;
+  const wasOnLatestPage = storyPageIndex >= renderedStoryPageCount - 1;
+  const pages = paginateStory(adv.storia, messages);
+  if (adventureChanged || (storyChanged && wasOnLatestPage)) storyPageIndex = pages.length - 1;
+  storyPageIndex = Math.min(storyPageIndex, pages.length - 1);
+  renderedStoryPageCount = pages.length;
+  const currentPage = pages[storyPageIndex];
+  const messageHtml = currentPage.map(m => {
+    const isModel = m.role === 'model';
+    const showDiceLink = isModel && m.isFinalFragment !== false && (m.diceRequested ?? requestsDiceRoll(m.text));
+    const diceLink = showDiceLink
+      ? '<a class="message-dice-link" href="https://dice-simulator.com/app/" target="_blank" rel="noopener noreferrer" title="Apri i dadi online in un popup" aria-label="Apri i dadi online in un popup"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m12 2 9 5v10l-9 5-9-5V7l9-5Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m3.5 7.3 8.5 5 8.5-5M12 12.3V22" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8" r="1" fill="currentColor"/><circle cx="16" cy="8" r="1" fill="currentColor"/><circle cx="12" cy="17" r="1" fill="currentColor"/></svg></a>'
+      : '';
+    return `<div class="message ${isModel ? 'model' : 'user'}">${escapeHtml(m.text)}${showDiceLink ? ` ${diceLink}` : ''}</div>`;
+  }).join('');
+  const pagination = document.getElementById('storyPagination');
+  pagination.hidden = pages.length <= 1;
+  document.getElementById('storyPageStatus').textContent = pages.length > 1
+    ? `Pagina ${storyPageIndex + 1} di ${pages.length}` : '';
+  document.getElementById('storyPrevious').disabled = storyPageIndex === 0;
+  document.getElementById('storyNext').disabled = storyPageIndex >= pages.length - 1;
+  if (adventureChanged || storyChanged || messages.innerHTML !== messageHtml) {
     messages.innerHTML = messageHtml;
     renderedAdventureId = adv.id;
-    if (adventureChanged || wasAtBottom) {
+    renderedStorySnapshot = storySnapshot;
+    renderedStoryPageCount = pages.length;
+    messages.querySelectorAll('.message-dice-link').forEach(link => {
+      link.addEventListener('click', event => {
+        const popup = window.open(link.href, 'dndDicePopup', 'popup=yes,width=1000,height=760,resizable=yes,scrollbars=yes');
+        if (popup) {
+          event.preventDefault();
+          popup.focus();
+        }
+      });
+    });
+    if (allowAutoScroll && (adventureChanged || storyChanged && wasOnLatestPage || wasAtBottom)) {
       requestAnimationFrame(() => { messages.scrollTop = messages.scrollHeight; });
     }
   }
@@ -1348,26 +1809,40 @@ function renderActive() {
   });
 }
 
+document.getElementById('storyPrevious').onclick = () => {
+  if (storyPageIndex > 0) {
+    storyPageIndex--;
+    renderActive(false);
+    document.getElementById('messages').scrollTop = 0;
+  }
+};
+document.getElementById('storyNext').onclick = () => {
+  const adventure = state?.adventures.find(item => item.id === activeId && item.joined);
+  if (adventure) {
+    const pages = paginateStory(adventure.storia, document.getElementById('messages'));
+    if (storyPageIndex < pages.length - 1) {
+      storyPageIndex++;
+      renderActive(false);
+      document.getElementById('messages').scrollTop = 0;
+    }
+  }
+};
+
 async function showInventory(name) {
   if (document.body.classList.contains('inventory-open') && activeInventoryName === name) {
     closeInventory();
     return;
   }
   activeInventoryName = name;
-  const panel = document.getElementById('inventoryPanel');
-  const content = document.getElementById('inventoryContent');
-  document.getElementById('inventoryTitle').textContent = `Inventario - ${name}`;
-  content.textContent = 'Caricamento inventario...';
-  document.body.classList.add('inventory-open');
-  panel.setAttribute('aria-hidden', 'false');
+  openDrawer(`Inventario - ${name}`, 'Caricamento inventario...');
   try {
     const result = await api('/api/action', {
       adventure_id:activeId,
       action:`/inventario ${name}`
     });
-    if (activeInventoryName === name) content.textContent = result.output || 'Inventario vuoto.';
+    if (activeInventoryName === name) document.getElementById('inventoryContent').textContent = result.output || 'Inventario vuoto.';
   } catch(e) {
-    if (activeInventoryName === name) content.textContent = e.message;
+    if (activeInventoryName === name) document.getElementById('inventoryContent').textContent = e.message;
   }
 }
 
@@ -1400,6 +1875,7 @@ document.getElementById('createAdv').onclick = async (event) => {
   if (!party.length) { alert('Seleziona almeno un personaggio.'); return; }
   const send = document.getElementById('sendBtn');
   send.disabled = true;
+  setProcessing(true);
   try {
     const result = await api('/api/adventure',{
       titolo:document.getElementById('advTitle').value,
@@ -1411,7 +1887,7 @@ document.getElementById('createAdv').onclick = async (event) => {
     document.getElementById('adventureDialog').close();
     await refresh();
   } catch(e) { alert(e.message); }
-  finally { send.disabled = false; }
+  finally { send.disabled = false; setProcessing(false); }
 };
 
 document.getElementById('sendBtn').onclick = sendAction;
@@ -1425,16 +1901,22 @@ async function sendAction() {
   if (!action) return;
   const send = document.getElementById('sendBtn');
   send.disabled = true;
+  setProcessing(true);
   document.getElementById('output').textContent = 'Il Dungeon Master sta valutando...';
   try {
     const result = await api('/api/action',{adventure_id:activeId,action});
     actionInput.value = '';
     document.getElementById('output').textContent = result.output || '';
     await refresh();
+    if (action.startsWith('/') && typeof result.output === 'string') {
+      const command = action.trim().split(/\s+/, 1)[0];
+      openDrawer(`Risultato ${command}`, result.output || 'Nessun contenuto da mostrare.');
+    }
   } catch(e) {
     document.getElementById('output').textContent = e.message;
   } finally {
     send.disabled = false;
+    setProcessing(false);
   }
 }
 

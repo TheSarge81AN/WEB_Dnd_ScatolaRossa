@@ -39,8 +39,9 @@ La pagina usa API HTTP JSON e riusa funzioni di `dnd-fork.py` per personaggi, av
 
 - login con cookie HttpOnly, logout e provisioning account riservato all'amministratore;
 - gestione account JSON locale oppure tabella PostgreSQL `web_users` remota, con hash/salt scrypt, reimpostazione password e revoca degli account;
-- pagina amministrativa per chiave Gemini e gestione account;
-- personaggi associati all'account che li crea;
+- pagina amministrativa per chiave Gemini, gestione account e pulizia di tutte le avventure (comprese quelle iniziali o senza proprietario);
+- personaggi associati all'account che li crea, eliminabili dall'interfaccia; l'eliminazione li rimuove dai party delle avventure ma è bloccata se il personaggio è l'ultimo membro di un'avventura;
+- i personaggi morti sono persistiti e mostrati nel Cimitero degli Eroi con il titolo dell'avventura in cui sono caduti; non sono ammessi ad azioni di gioco, nuove avventure o join; risultati dei comandi slash esposti nel drawer condiviso con l'inventario;
 - elenco delle avventure condivise e join con un personaggio proprio;
 - azioni e risposte Gemini salvate nel database configurato e visualizzate dagli altri partecipanti tramite polling ogni 2,5 secondi;
 - azioni concorrenti serializzate per singola avventura per preservare l'ordine del transcript;
@@ -89,6 +90,8 @@ Migrazioni compatibili all'avvio:
 - `party_json`
 - `stato_dungeon_json`
 - `incantesimi_json`
+- `deceduto` nei personaggi; PF a zero o inferiori sono migrati come personaggi deceduti
+- `avventura_morte` nei personaggi per registrare il titolo dell'avventura in cui sono caduti
 
 Le colonne JSON sono stringhe serializzate SQLite, da trattare come payload Python dopo `json.loads()`.
 
@@ -113,6 +116,7 @@ Il database ha priorita una volta migrato. Evitare modifiche alla migrazione sen
 - Modalita interattiva con chiamata dadi reali; modalita classica con autodadi.
 - Party locale e host/client LAN sulla porta `5555`.
 - Audio 8-bit con sintesi `.wav` se mancanti.
+- Interfaccia web HTML/CSS inclusa in `dnd_web.py` (server HTTP standard library, non Flask), con palette Scatola Rossa, Foresta, Arcano e Notte salvata in `localStorage`.
 - Gemini tramite SDK ufficiale Python, con elenco di modelli fallback.
 - PDF: schede personaggio, mappe tattiche/dossier e manuale comandi.
 - Esportazione cronache Markdown.
