@@ -1,5 +1,6 @@
 # Credenziali e chiavi segrete
 .gemini_api_key
+utenti_web.json
 
 # Cache Python
 __pycache__/
@@ -24,5 +25,10 @@ mappe/*
 schede/*
 !schede/.gitkeep
 
-# Configurazioni IDE personali
+# File locali generati dagli IDE
 .vscode/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates

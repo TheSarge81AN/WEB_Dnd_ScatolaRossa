@@ -68,7 +68,7 @@ Per usare il nuovo menu web locale:
 python dnd_web.py
 ```
 
-Il server apre `http://127.0.0.1:8765`; accedi con l'account amministratore oppure con un account creato dall'amministratore. L'amministratore usa `WEB_USERNAME` e `DnD_USER_PASSWORD`; nel pannello Amministrazione può gestire gli account salvati in `utenti_web.json` e aggiornare la chiave Gemini. Gli account giocatore sono protetti con hash e salt, non in chiaro. In locale, se le variabili admin mancano, vengono richieste nel terminale. È possibile passare la chiave API come argomento:
+Il server apre `http://127.0.0.1:8765`; accedi con l'account amministratore oppure con un account creato dall'amministratore. L'amministratore usa `WEB_USERNAME` e `DnD_USER_PASSWORD`; nel pannello Amministrazione può gestire gli account e aggiornare la chiave Gemini. Con `DB_LOCATION=local` gli account giocatore sono conservati in `utenti_web.json`; con una connection string PostgreSQL sono conservati nel DB remoto. Le password sono protette con hash e salt, mai in chiaro. In locale, se le variabili admin mancano, vengono richieste nel terminale. È possibile passare la chiave API come argomento:
 
 ```bash
 python dnd_web.py LA_TUA_CHIAVE_API
@@ -77,7 +77,7 @@ python dnd_web.py LA_TUA_CHIAVE_API
 L'interfaccia web sostituisce il menu e gli input della console per le operazioni principali:
 
 - login e sessione persistente nel browser; gli account sono creati dall'amministratore;
-- gestione amministrativa degli account nel file `utenti_web.json` e della chiave Gemini;
+- gestione amministrativa degli account (JSON locale o tabella PostgreSQL remota) e della chiave Gemini;
 - creazione di personaggi associati al proprio account;
 - creazione di avventure e join alle sessioni esistenti usando un proprio personaggio;
 - selezione ed eliminazione delle avventure create dal proprio account;
@@ -87,20 +87,21 @@ L'interfaccia web sostituisce il menu e gli input della console per le operazion
 - invio delle azioni al DM;
 - consultazione del party e della cronaca.
 
-I comandi `/...` possono essere inviati dalla casella azione della pagina. Il file utenti viene inizializzato con `{"users": []}` e aggiornato dal pannello; gli account contengono `username`, `salt` e `password_hash` scrypt, mai password in chiaro. Crea o reimposta le password dal pannello amministrativo.
+I comandi `/...` possono essere inviati dalla casella azione della pagina. In modalità locale il file utenti viene inizializzato con `{"users": []}` e aggiornato dal pannello; in modalità PostgreSQL i dati account sono memorizzati nella tabella `web_users`. In entrambi i casi sono conservati salt e hash scrypt, mai password in chiaro. Crea o reimposta le password dal pannello amministrativo.
 
 ### Pubblicazione su Render
 
-Il repository include `render.yaml` per creare un Web Service gratuito. Puoi usarlo come Blueprint oppure impostare manualmente:
+Il repository include `render.yaml` per creare un Web Service Render con disco persistente (piano Starter a pagamento). Puoi usarlo come Blueprint oppure impostare manualmente:
 
-- **Build Command:** `python -m compileall -q dnd_web.py dnd_fork.py web_auth.py`
+- **Build Command:** `python -m compileall -q dnd_web.py dnd_fork.py web_auth.py db_backend.py`
 - **Start Command:** `python dnd_web.py`
 - **Health Check Path:** `/health`
-- **Environment:** `WEB_USERNAME`, `DnD_USER_PASSWORD`, `GEMINI_API_KEY`
+- **Environment:** `DB_LOCATION`, `WEB_USERNAME`, `DnD_USER_PASSWORD`, `GEMINI_API_KEY`
+- In modalità locale: disco persistente da almeno 1 GB montato su `/var/data` e `DND_DATA_DIR=/var/data`
 
 Il servizio usa `PORT` fornita da Render e ascolta su `0.0.0.0`. `WEB_USERNAME` identifica l'amministratore e Render genera `DnD_USER_PASSWORD`. L'amministratore crea gli account giocatore dalla pagina Amministrazione; le sessioni attive sono condivise tra account e la cronaca viene aggiornata automaticamente nel browser.
 
-**Persistenza:** sessioni, personaggi, campagne e messaggi sono nel database SQLite `dnd_becmi.db`; gli account giocatore sono nel file `utenti_web.json` e la chiave amministrata nel file protetto `.gemini_api_key`. Il filesystem del piano Free è effimero: questi dati possono andare persi a riavvii o ridistribuzioni. Per conservarli configura uno storage persistente o migra i dati verso un servizio esterno.
+**Database e persistenza:** `DB_LOCATION` non distingue maiuscole/minuscole per il valore `local`. In questo caso viene usato SQLite `dnd_becmi.db` e su Render occorre il disco persistente montato su `/var/data` (`DND_DATA_DIR=/var/data`); account e chiave Gemini restano nei file `utenti_web.json` e `.gemini_api_key` sul disco. Se `DB_LOCATION` contiene una connection string `postgres://` o `postgresql://`, l'app usa PostgreSQL remoto per personaggi, avventure, messaggi, account, sessioni e associazioni; il file `utenti_web.json`, se presente al primo avvio e la tabella `web_users` è vuota, viene importato una volta. Per Neon copia la connection string PostgreSQL **pooled** dalla dashboard e impostala in Render come variabile segreta `DB_LOCATION` (in genere inizia con `postgresql://` e include `sslmode=require`); non inserirla nel repository. In modalità remota non è necessario un disco per i dati DB; la chiave salvata dal pannello resta invece locale, quindi usa `GEMINI_API_KEY` oppure conserva `.gemini_api_key` su un disco persistente. Le connessioni PostgreSQL sono gestite da `psycopg`. Passare da SQLite a PostgreSQL non trasferisce automaticamente personaggi, avventure o cronache già salvati nel DB SQLite: esportali/migrali prima del cambio. Il Blueprint è configurato per modalità locale con disco persistente e piano Starter; per usare Neon su Render Free, imposta `DB_LOCATION` nella dashboard, seleziona il piano Free e rimuovi dal servizio sia il disco sia la variabile `DND_DATA_DIR` (il filesystem gratuito resta effimero).
 
 Il repository include lo script principale pronto all'uso:
 
@@ -151,8 +152,9 @@ Durante la partita puoi digitare comandi naturali per il DM oppure utilizzare i 
 ```text
 ├── dnd-fork.py            # Entry point principale CLI
 ├── dnd_web.py             # Entry point del sito web multiplayer
-├── web_auth.py            # Autenticazione, account JSON e appartenenze
-├── utenti_web.json        # Account giocatori (generato/aggiornato dall'admin, ignorato da Git)
+├── db_backend.py          # Backend SQLite locale / PostgreSQL remoto
+├── web_auth.py            # Autenticazione, account e appartenenze
+├── utenti_web.json        # Account locali (generato dall'admin, ignorato da Git)
 ├── db_manager.py          # Modulo per la gestione del database SQLite
 ├── manuale_comandi_dnd.pdf# Manuale comandi ufficiale pronto per la stampa
 ├── avventure_dnd.json     # Dati iniziali delle avventure predefinite

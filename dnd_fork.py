@@ -7,7 +7,6 @@ import socket
 import base64
 import random
 import select
-import sqlite3
 import subprocess
 import threading
 import math
@@ -18,6 +17,7 @@ import zlib
 import hashlib
 from datetime import datetime
 
+import db_backend
 from google import genai
 from google.genai import errors, types
 
@@ -243,9 +243,7 @@ RANGHI_IMMORTALI = [
 class DnDDatabase:
     def __init__(self, db_path=DB_FILE):
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON;")
+        self.conn = db_backend.connect(self.db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode = WAL;")
         self._crea_schema()
 
@@ -315,12 +313,12 @@ class DnDDatabase:
                 CREATE INDEX IF NOT EXISTS idx_inv_pg ON inventario(personaggio_id);
                 CREATE INDEX IF NOT EXISTS idx_note_avv ON diario_note(avventura_id, id);
             """)
-            cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(avventure)").fetchall()]
+            cols = self.conn.table_columns("avventure")
             if "party_json" not in cols:
                 self.conn.execute("ALTER TABLE avventure ADD COLUMN party_json TEXT DEFAULT '[]'")
             if "stato_dungeon_json" not in cols:
                 self.conn.execute("ALTER TABLE avventure ADD COLUMN stato_dungeon_json TEXT DEFAULT '{}'")
-            cols_pg = [r["name"] for r in self.conn.execute("PRAGMA table_info(personaggi)").fetchall()]
+            cols_pg = self.conn.table_columns("personaggi")
             if "razza" not in cols_pg:
                 self.conn.execute("ALTER TABLE personaggi ADD COLUMN razza TEXT NOT NULL DEFAULT 'Umano'")
             if "incantesimi_json" not in cols_pg:
@@ -478,7 +476,7 @@ class DnDDatabase:
 
     def carica_tutte_avventure(self) -> dict:
         avventure = {}
-        cur = self.conn.execute("SELECT * FROM avventure ORDER BY rowid ASC")
+        cur = self.conn.execute("SELECT * FROM avventure ORDER BY id ASC")
         for r in cur.fetchall():
             adv_id = r["id"]
             msg_cur = self.conn.execute(
@@ -524,9 +522,9 @@ class DnDDatabase:
         msg_cnt = self.conn.execute("SELECT COUNT(*) FROM messaggi_storia").fetchone()[0]
         note_cnt = self.conn.execute("SELECT COUNT(*) FROM diario_note").fetchone()[0]
         inv_cnt = self.conn.execute("SELECT COUNT(*) FROM inventario").fetchone()[0]
-        size_kb = round(os.path.getsize(self.db_path) / 1024, 1) if os.path.exists(self.db_path) else 0
+        size_kb = round(os.path.getsize(self.db_path) / 1024, 1) if not db_backend.is_remote(self.db_path) and os.path.exists(self.db_path) else None
         return {
-            "file": self.db_path,
+            "file": "PostgreSQL remoto" if db_backend.is_remote(self.db_path) else self.db_path,
             "size_kb": size_kb,
             "personaggi": pg_cnt,
             "inventario": inv_cnt,
@@ -924,10 +922,10 @@ HELP_TESTO = f"""{CIANO}{GRASSETTO}=== GUIDA AI COMANDI - D&D SCATOLA ROSSA (v9.
   {VERDE}/mappa{RESET} (o /mappa pdf)    Mostra mappa ASCII ed esporta PDF A4 con mappa tattica per la campagna.
   {VERDE}/suoni{RESET} (o /suoni test)   Attiva/disattiva gli effetti sonori o esegue il test audio retro.
 
-{GIALLO}Database SQLite, Navigazione e Uscita:{RESET}
+{GIALLO}Database, Navigazione e Uscita:{RESET}
   {VERDE}/esporta{RESET} (o /esporta pdf) Esporta cronaca Markdown, mappa tattica o scheda in PDF A4.
   {VERDE}/modello{RESET} (o /ai)         Mostra o imposta il modello Gemini attivo e la catena di fallback.
-  {VERDE}/sql{RESET} (o /db)             Mostra stato e statistiche del database SQLite ({DB_FILE}).
+  {VERDE}/sql{RESET} (o /db)             Mostra stato e statistiche del database ({"PostgreSQL remoto" if db_backend.is_remote(DB_FILE) else DB_FILE}).
   {VERDE}/storico{RESET}                 Mostra gli ultimi 3 turni dell'avventura corrente.
   {VERDE}/riassunto{RESET}               Comprime la memoria per mantenere veloce l'IA nelle partite lunghe.
   {VERDE}/stop{RESET} (o /menu, /0)      Salva l'avventura e torna al Menu Principale.

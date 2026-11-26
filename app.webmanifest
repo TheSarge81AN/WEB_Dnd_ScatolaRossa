@@ -1,0 +1,16 @@
+{
+  "name": "D&D - Scatola Rossa",
+  "short_name": "D&D Scatola Rossa",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#17130f",
+  "theme_color": "#9c1c20",
+  "icons": [
+    {
+      "src": "/imgs/app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -4,7 +4,10 @@ import io
 import json
 import os
 import re
+import shutil
+import sqlite3
 import sys
+import tempfile
 import threading
 import uuid
 import webbrowser
@@ -14,6 +17,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import db_backend
 import dnd_fork as game
 import web_auth
 
@@ -21,11 +25,59 @@ import web_auth
 ROOT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(ROOT)
 IS_RENDER = bool(os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"))
+DB_LOCATION = os.environ.get("DB_LOCATION", "local").strip()
+DATABASE_IS_REMOTE = DB_LOCATION.casefold() != "local"
+if DATABASE_IS_REMOTE and not db_backend.is_remote(DB_LOCATION):
+    raise ValueError("DB_LOCATION deve essere 'local' oppure una connection string PostgreSQL (postgres:// o postgresql://).")
+DATA_DIR_ENV = os.environ.get("DND_DATA_DIR", "").strip()
+if IS_RENDER and not DATABASE_IS_REMOTE and not DATA_DIR_ENV:
+    raise RuntimeError("DND_DATA_DIR non configurata. Su Render impostala sul mount path del disco persistente (/var/data).")
+DATA_DIR = os.path.abspath(DATA_DIR_ENV or ROOT)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def migrate_persistent_data(filename, sqlite_database=False):
+    source_path = os.path.join(ROOT, filename)
+    target_path = os.path.join(DATA_DIR, filename)
+    if os.path.abspath(source_path) == os.path.abspath(target_path) or os.path.exists(target_path) or not os.path.isfile(source_path):
+        return
+    if sqlite_database:
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix=".migration-", suffix=".db", dir=DATA_DIR, delete=False) as temporary_file:
+                temporary_path = temporary_file.name
+            source = sqlite3.connect(source_path)
+            target = sqlite3.connect(temporary_path)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+            os.replace(temporary_path, target_path)
+        except Exception:
+            if temporary_path and os.path.exists(temporary_path):
+                os.remove(temporary_path)
+            raise
+    else:
+        shutil.copy2(source_path, target_path)
+
+
+DB_FILENAME = os.path.basename(game.DB_FILE)
+KEY_FILENAME = os.path.basename(game.KEY_FILE)
+migrate_persistent_data("utenti_web.json")
+migrate_persistent_data(KEY_FILENAME)
+if DATABASE_IS_REMOTE:
+    game.DB_FILE = DB_LOCATION
+    game.KEY_FILE = os.path.join(DATA_DIR, KEY_FILENAME)
+else:
+    migrate_persistent_data(DB_FILENAME, sqlite_database=True)
+    game.DB_FILE = os.path.join(DATA_DIR, DB_FILENAME)
+    game.KEY_FILE = os.path.join(DATA_DIR, KEY_FILENAME)
 HOST = os.environ.get("HOST", "0.0.0.0" if IS_RENDER else "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 WEB_USERNAME = os.environ.get("WEB_USERNAME", "")
 WEB_PASSWORD = os.environ.get("DnD_USER_PASSWORD", "")
-USERS_FILE = os.path.join(ROOT, "utenti_web.json")
+USERS_FILE = os.path.join(DATA_DIR, "utenti_web.json")
 DB = game.DnDDatabase(game.DB_FILE)
 AUTH_STORE = web_auth.WebAuthStore(game.DB_FILE, USERS_FILE, WEB_USERNAME, WEB_PASSWORD)
 LOCK = threading.Lock()
@@ -325,6 +377,27 @@ class WebHandler(BaseHTTPRequestHandler):
         if path == "/health":
             json_response(self, 200, {"status": "ok"})
             return
+        static_files = {
+            "/app.webmanifest": ("app.webmanifest", "application/manifest+json"),
+            "/imgs/app-icon.svg": (os.path.join("imgs", "app-icon.svg"), "image/svg+xml"),
+            "/imgs/DnD.webp": (os.path.join("imgs", "DnD.webp"), "image/webp"),
+        }
+        if path in static_files:
+            relative_path, content_type = static_files[path]
+            try:
+                with open(os.path.join(ROOT, relative_path), "rb") as asset_file:
+                    payload = asset_file.read()
+            except OSError as exc:
+                json_response(self, 500, {"error": f"Impossibile leggere l'asset {path}: {exc}"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if path == "/" or path == "/index.html":
             self.send_response(200)
             payload = PAGE.encode("utf-8")
@@ -376,7 +449,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 "races": RAZZE_PERSONAGGIO,
                 "modules": game.elenca_moduli_pdf(),
                 "key_set": bool(key),
-                "db": game.DB_FILE,
+                "db": "PostgreSQL remoto" if DATABASE_IS_REMOTE else game.DB_FILE,
             })
             return
         json_response(self, 404, {"error": "Endpoint non trovato"})
@@ -642,6 +715,9 @@ PAGE = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#9c1c20">
+  <link rel="icon" type="image/svg+xml" href="/imgs/app-icon.svg">
+  <link rel="manifest" href="/app.webmanifest">
   <title>D&D - Scatola Rossa</title>
   <style>
     :root { --red:#9c1c20; --gold:#d5ad55; --ink:#191512; --paper:#efe6cf; --panel:#fffaf0; --green:#4a6944; }
@@ -858,7 +934,7 @@ PAGE = r"""<!doctype html>
   <main class="admin-main">
     <section class="panel">
       <h2>Account giocatori</h2>
-      <p class="muted">Gli account sono salvati in <code>utenti_web.json</code>; le password nel file sono protette con hash e salt.</p>
+      <p class="muted">Gli account sono conservati in modo protetto; le password non sono mai salvate in chiaro.</p>
       <form id="adminUserForm">
         <label for="newUsername">Nome utente</label><input id="newUsername" minlength="3" maxlength="32" required>
         <label for="newUserPassword">Password (almeno 10 caratteri)</label><input id="newUserPassword" type="password" minlength="10" required>
@@ -1169,14 +1245,25 @@ async function refresh() {
     `<option value="${escapeHtml(race)}">${escapeHtml(race)}</option>`
   ).join('');
   if (state.races.includes(selectedRace)) raceSelect.value = selectedRace;
-  document.getElementById('advModule').innerHTML = '<option value="">Scenario predefinito</option>' +
+  const moduleSelect = document.getElementById('advModule');
+  const selectedModule = moduleSelect.value;
+  moduleSelect.innerHTML = '<option value="">Scenario predefinito</option>' +
     state.modules.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
-  document.getElementById('advParty').innerHTML = state.my_characters.map(c =>
+  if ([...moduleSelect.options].some(option => option.value === selectedModule)) moduleSelect.value = selectedModule;
+
+  const partySelect = document.getElementById('advParty');
+  const selectedParty = new Set([...partySelect.selectedOptions].map(option => option.value));
+  partySelect.innerHTML = state.my_characters.map(c =>
     `<option value="${escapeHtml(c.nome)}">${escapeHtml(c.nome)} - Classe: ${escapeHtml(c.classe)} | Razza: ${escapeHtml(c.razza || 'Umano')} Liv. ${c.livello}</option>`
   ).join('');
-  document.getElementById('joinCharacter').innerHTML = state.my_characters.map(c =>
+  [...partySelect.options].forEach(option => { option.selected = selectedParty.has(option.value); });
+
+  const joinCharacterSelect = document.getElementById('joinCharacter');
+  const selectedJoinCharacter = joinCharacterSelect.value;
+  joinCharacterSelect.innerHTML = state.my_characters.map(c =>
     `<option value="${escapeHtml(c.nome)}">${escapeHtml(c.nome)} - Classe: ${escapeHtml(c.classe)} | Razza: ${escapeHtml(c.razza || 'Umano')} Liv. ${c.livello}</option>`
   ).join('');
+  if (state.my_characters.some(c => c.nome === selectedJoinCharacter)) joinCharacterSelect.value = selectedJoinCharacter;
   if (!state.adventures.some(a => a.id === activeId && a.joined)) {
     activeId = state.adventures.find(a => a.joined)?.id || null;
   }

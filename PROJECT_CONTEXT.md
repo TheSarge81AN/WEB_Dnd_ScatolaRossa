@@ -35,27 +35,27 @@ python dnd_web.py
 python dnd_web.py LA_CHIAVE_GEMINI
 ```
 
-La pagina usa API HTTP JSON sulla stessa sorgente `dnd_becmi.db` e riusa funzioni di `dnd-fork.py` per personaggi, avventure, Gemini, comandi e PDF. `web_auth.py` gestisce account, hash password, cookie di sessione, proprietà personaggi e appartenenza alle avventure. Funzionalita web:
+La pagina usa API HTTP JSON e riusa funzioni di `dnd-fork.py` per personaggi, avventure, Gemini, comandi e PDF. `DB_LOCATION=local` usa SQLite; una connection string `postgres://`/`postgresql://` usa PostgreSQL tramite `db_backend.py` e `psycopg`, compatibile con Neon. `web_auth.py` gestisce account, hash password, cookie di sessione, proprietà personaggi e appartenenza alle avventure. Funzionalita web:
 
 - login con cookie HttpOnly, logout e provisioning account riservato all'amministratore;
-- gestione account in `utenti_web.json` con hash/salt scrypt, reimpostazione password e revoca degli account;
+- gestione account JSON locale oppure tabella PostgreSQL `web_users` remota, con hash/salt scrypt, reimpostazione password e revoca degli account;
 - pagina amministrativa per chiave Gemini e gestione account;
 - personaggi associati all'account che li crea;
 - elenco delle avventure condivise e join con un personaggio proprio;
-- azioni e risposte Gemini salvate in SQLite e visualizzate dagli altri partecipanti tramite polling ogni 2,5 secondi;
+- azioni e risposte Gemini salvate nel database configurato e visualizzate dagli altri partecipanti tramite polling ogni 2,5 secondi;
 - azioni concorrenti serializzate per singola avventura per preservare l'ordine del transcript;
 - eliminazione consentita solo al creatore dell'avventura;
 - selezione modulo PDF, inventario, comandi slash, cronaca e riepilogo party.
 
-L'amministratore è identificato da `WEB_USERNAME` e `DnD_USER_PASSWORD`; su Render la password è generata dal Blueprint. Solo l'amministratore può creare, aggiornare ed eliminare account nella pagina admin. Gli account giocatore sono definiti in `utenti_web.json` con salt/hash scrypt, mai con password in chiaro. La stessa pagina aggiorna la chiave Gemini salvandola nel file protetto `.gemini_api_key`; una chiave salvata ha precedenza su `GEMINI_API_KEY`. Gli endpoint di gioco richiedono un account autenticato; `/health` resta pubblico e i cookie su Render sono marcati `Secure`.
+L'amministratore è identificato da `WEB_USERNAME` e `DnD_USER_PASSWORD`; su Render la password è generata dal Blueprint. Solo l'amministratore può creare, aggiornare ed eliminare account nella pagina admin. Gli account giocatore sono definiti in `utenti_web.json` con salt/hash scrypt in modalità locale, oppure nella tabella `web_users` del DB PostgreSQL remoto; mai password in chiaro. La stessa pagina aggiorna la chiave Gemini salvandola nel file protetto `.gemini_api_key`; una chiave salvata ha precedenza su `GEMINI_API_KEY`. Gli endpoint di gioco richiedono un account autenticato; `/health` resta pubblico e i cookie su Render sono marcati `Secure`.
 
-Account, associazioni, avventure e transcript sono conservati nel DB SQLite. Il filesystem del piano Free è effimero: dati e account possono essere persi a riavvii/redeploy; serve storage persistente per conservarli. La migrazione JSON viene tentata all'avvio per inizializzare un DB vuoto.
+`DB_LOCATION=local` (default, anche `LOCAL`) usa SQLite e conserva account in `utenti_web.json`; su Render richiede `DND_DATA_DIR` sul disco persistente `/var/data`. Se `DB_LOCATION` è una URI PostgreSQL (`postgres://` o `postgresql://`), personaggi, inventario, avventure, messaggi, note, account, sessioni e associazioni sono salvati in PostgreSQL (Neon supportato via `psycopg`). Un eventuale `utenti_web.json` viene importato all'avvio remoto solo se `web_users` è vuota; le operazioni account successive agiscono sul DB. Il file `.gemini_api_key` rimane locale: con un filesystem effimero usa la variabile `GEMINI_API_KEY` o un disco persistente. Il Blueprint Render predefinito usa SQLite su disco persistente da 1 GB e piano Starter; Neon consente di spostare i dati DB fuori dal filesystem, ma il piano Render Free resta effimero e può sospendere il servizio. La conversione del DB SQLite esistente a PostgreSQL non è automatica; pianificare una migrazione prima di cambiare backend.
 
 Per il motore CLI la chiave viene risolta nell'ordine: argomento CLI, `GEMINI_API_KEY`, `.gemini_api_key`, richiesta interattiva. Per `dnd_web.py` l'argomento CLI ha precedenza; altrimenti `.gemini_api_key` salvata dal pannello admin precede `GEMINI_API_KEY`. Il file chiave usa permessi Unix `0600` dove supportato; `utenti_web.json` è ignorato da Git.
 
 ## Architettura
 
-Il programma e prevalentemente monolitico: configurazione, modelli dati, SQLite, chiamate REST, UI ANSI, audio, PDF, LAN e loop di gioco stanno nel singolo entry point. La separazione logica e ottenuta tramite classi e funzioni.
+Il programma CLI e prevalentemente monolitico: configurazione, modelli dati, SQLite, chiamate REST, UI ANSI, audio, PDF, LAN e loop di gioco stanno nel singolo entry point. Il server web usa `db_backend.py` per selezionare SQLite locale o PostgreSQL remoto.
 
 ### Flusso principale
 
@@ -125,8 +125,9 @@ dnd-fork.py                 Entry point principale CLI
 dnd_fork.py                 Alias esatto del punto d'ingresso CLI
 dnd.py / dnd-v9_1_5.py      Copia storica della versione precedente
 dnd_web.py                  Entry point dell'interfaccia web e deploy Render
-web_auth.py                 Account JSON, sessioni e partecipazione web
-utenti_web.json              Account giocatori runtime (ignorato da Git)
+db_backend.py               Adattatore SQLite locale / PostgreSQL remoto
+web_auth.py                 Account JSON/DB, sessioni e partecipazione web
+utenti_web.json              Account giocatori runtime locale (ignorato da Git)
 db_manager.py               Database demo indipendente non usato dal gioco
 avventure_dnd.json          Seed/migrazione avventure legacy
 personaggi_dnd.json         Seed/migrazione personaggi legacy
@@ -196,7 +197,7 @@ Cartella `suoni/`. Il motore prova prima player disponibili (`paplay`, `pw-play`
 Verifica minima:
 
 ```bash
-python -m compileall dnd-fork.py dnd_fork.py dnd.py dnd-v9_1_5.py db_manager.py dnd_web.py web_auth.py
+python -m compileall dnd-fork.py dnd_fork.py dnd.py dnd-v9_1_5.py db_manager.py dnd_web.py web_auth.py db_backend.py
 ```
 
 Non esiste uno script ufficiale di test. Per una modifica mirata, creare o usare uno snippet diretto che eserciti la funzione modificata senza avviare Gemini o una partita interattiva. I test devono coprire: migrazioni SQLite, salvataggi JSON, calcoli BECMI, parsing comandi/dadi, generazione PDF e timeout/fallback API.

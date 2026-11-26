@@ -2,11 +2,19 @@ services:
   - type: web
     name: dnd-scatola-rossa
     runtime: python
-    plan: free
-    buildCommand: pip install -r requirements.txt && python -m compileall -q dnd_web.py dnd_fork.py web_auth.py
+    plan: starter
+    buildCommand: pip install -r requirements.txt && python -m compileall -q dnd_web.py dnd_fork.py web_auth.py db_backend.py
     startCommand: python dnd_web.py
     healthCheckPath: /health
+    disk:
+      name: dnd-scatola-rossa-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
+      - key: DND_DATA_DIR
+        value: /var/data
+      - key: DB_LOCATION
+        value: local
       - key: WEB_USERNAME
         value: dungeon-master
       - key: DnD_USER_PASSWORD

@@ -4,10 +4,11 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+
+import db_backend
 
 
 SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -21,8 +22,9 @@ class WebAuthStore:
 		self.users_path = users_path
 		self.admin_username = ""
 		self.admin_password = ""
+		self.remote = db_backend.is_remote(db_path)
 		self.file_lock = threading.Lock()
-		if not os.path.exists(self.users_path):
+		if not self.remote and not os.path.exists(self.users_path):
 			self._write_users([])
 		with self._connect() as conn:
 			conn.executescript("""
@@ -56,14 +58,27 @@ class WebAuthStore:
 					FOREIGN KEY (user_id) REFERENCES web_users(id) ON DELETE CASCADE
 				);
 			""")
+			if self.remote:
+				conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_web_users_username_ci ON web_users (LOWER(username))")
+				conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_web_character_name_ci ON web_character_owners (LOWER(character_name))")
+		if self.remote and os.path.isfile(self.users_path):
+			with self._connect() as conn:
+				if not conn.execute("SELECT 1 FROM web_users LIMIT 1").fetchone():
+					with self.file_lock:
+						users = self._read_users_locked()
+					for user in users:
+						if admin_username and user["username"].casefold() == admin_username.casefold():
+							continue
+						conn.execute(
+							"INSERT INTO web_users (username, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?)",
+							(user["username"], bytes.fromhex(user["salt"]), bytes.fromhex(user["password_hash"]), int(time.time()))
+						)
 		if admin_username or admin_password:
 			self.configure_admin(admin_username, admin_password)
 
 	@contextmanager
 	def _connect(self):
-		conn = sqlite3.connect(self.db_path, timeout=10)
-		conn.row_factory = sqlite3.Row
-		conn.execute("PRAGMA foreign_keys = ON")
+		conn = db_backend.connect(self.db_path, timeout=10)
 		try:
 			yield conn
 			conn.commit()
@@ -141,10 +156,11 @@ class WebAuthStore:
 		password = str(password or "")
 		if not ADMIN_USERNAME_PATTERN.fullmatch(username) or len(password) < 10 or len(password) > 1024:
 			raise ValueError("WEB_USERNAME deve contenere 1-64 lettere, numeri, punto, trattino, underscore o '&'; DnD_USER_PASSWORD deve contenere almeno 10 caratteri.")
-		with self.file_lock:
-			users = self._read_users_locked()
-			if any(str(user["username"]).casefold() == username.casefold() for user in users):
-				raise ValueError("Rimuovi l'account amministratore da utenti_web.json: è gestito dalle variabili d'ambiente.")
+		if not self.remote:
+			with self.file_lock:
+				users = self._read_users_locked()
+				if any(str(user["username"]).casefold() == username.casefold() for user in users):
+					raise ValueError("Rimuovi l'account amministratore da utenti_web.json: è gestito dalle variabili d'ambiente.")
 		self.admin_username = username
 		self.admin_password = password
 		with self._connect() as conn:
@@ -181,17 +197,38 @@ class WebAuthStore:
 
 	def add_user(self, username, password):
 		username, password = self._validate_account(username, password)
+		salt = secrets.token_bytes(16)
+		password_hash = self._password_hash(password, salt)
+		if self.remote:
+			with self._connect() as conn:
+				if conn.execute("SELECT 1 FROM web_users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone():
+					raise ValueError("Nome utente già utilizzato.")
+				conn.execute(
+					"INSERT INTO web_users (username, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?)",
+					(username, salt, password_hash, int(time.time()))
+				)
+				row = conn.execute("SELECT id, username FROM web_users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone()
+			return self._user_view(row)
 		with self.file_lock:
 			users = self._read_users_locked()
 			if any(str(user.get("username", "")).casefold() == username.casefold() for user in users):
 				raise ValueError("Nome utente già utilizzato.")
-			salt = secrets.token_bytes(16)
-			users.append({"username": username, "salt": salt.hex(), "password_hash": self._password_hash(password, salt).hex()})
+			users.append({"username": username, "salt": salt.hex(), "password_hash": password_hash.hex()})
 			self._write_users_locked(users)
-		return self._sync_user(username, salt, bytes.fromhex(users[-1]["password_hash"]))
+		return self._sync_user(username, salt, password_hash)
 
 	def update_password(self, username, password):
 		username, password = self._validate_account(username, password)
+		if self.remote:
+			salt = secrets.token_bytes(16)
+			password_hash = self._password_hash(password, salt)
+			with self._connect() as conn:
+				row = conn.execute("SELECT id FROM web_users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone()
+				if not row:
+					raise ValueError("Utente non trovato.")
+				conn.execute("UPDATE web_users SET password_salt = ?, password_hash = ? WHERE id = ?", (salt, password_hash, row["id"]))
+				conn.execute("DELETE FROM web_sessions WHERE user_id = ?", (row["id"],))
+			return True
 		with self.file_lock:
 			users = self._read_users_locked()
 			account = next((user for user in users if str(user.get("username", "")).casefold() == username.casefold()), None)
@@ -214,6 +251,12 @@ class WebAuthStore:
 		username = str(username or "").strip()
 		if self._is_admin_name(username):
 			raise ValueError("L'account amministratore non può essere eliminato da questa pagina.")
+		if self.remote:
+			with self._connect() as conn:
+				cursor = conn.execute("DELETE FROM web_users WHERE LOWER(username) = LOWER(?)", (username,))
+				if cursor.rowcount == 0:
+					raise ValueError("Utente non trovato.")
+			return True
 		with self.file_lock:
 			users = self._read_users_locked()
 			remaining = [user for user in users if str(user.get("username", "")).casefold() != username.casefold()]
@@ -225,6 +268,10 @@ class WebAuthStore:
 		return True
 
 	def list_users(self):
+		if self.remote:
+			with self._connect() as conn:
+				rows = conn.execute("SELECT username FROM web_users WHERE LOWER(username) <> LOWER(?) ORDER BY LOWER(username)", (self.admin_username,)).fetchall()
+			return [str(row["username"]) for row in rows]
 		with self.file_lock:
 			users = self._read_users_locked()
 		return sorted((str(user["username"]) for user in users), key=str.casefold)
@@ -234,6 +281,15 @@ class WebAuthStore:
 		password = str(password or "")
 		if len(password) > 1024:
 			return None
+		if self.remote and not self._is_admin_name(username):
+			with self._connect() as conn:
+				row = conn.execute("SELECT id, username, password_salt, password_hash FROM web_users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone()
+			if not row:
+				self._password_hash(password, b"dnd-web-dummy-salt")
+				return None
+			if not hmac.compare_digest(self._password_hash(password, row["password_salt"]), row["password_hash"]):
+				return None
+			return self._user_view(row)
 		if self._is_admin_name(username):
 			if not hmac.compare_digest(password.encode("utf-8"), self.admin_password.encode("utf-8")):
 				return None
@@ -283,7 +339,7 @@ class WebAuthStore:
 			if row["expires_at"] <= now:
 				conn.execute("DELETE FROM web_sessions WHERE token_hash = ?", (token_hash,))
 				return None
-			if not self._is_admin_name(row["username"]):
+			if not self.remote and not self._is_admin_name(row["username"]):
 				with self.file_lock:
 					users = self._read_users_locked()
 					account = next((user for user in users if str(user.get("username", "")).casefold() == row["username"].casefold()), None)
@@ -320,7 +376,7 @@ class WebAuthStore:
 					"INSERT INTO web_character_owners (character_name, user_id) VALUES (?, ?)",
 					(character_name, user_id)
 				)
-		except sqlite3.IntegrityError as exc:
+		except db_backend.IntegrityError as exc:
 			raise ValueError("Il personaggio è già associato a un account.") from exc
 
 	def character_names(self, user_id):
