@@ -2,7 +2,7 @@
 
 Un gioco di ruolo testuale completo per terminale basato sulle regole storiche di **Dungeons & Dragons Edizione BECMI (Scatola Rossa, Frank Mentzer 1983)**, animato dall'intelligenza artificiale **Google Gemini** come Dungeon Master interattivo.
 
-Il progetto è sviluppato in **Python 3 puro** utilizzando esclusivamente la **Standard Library** (nessun `pip install` o libreria esterna richiesta).
+Il motore di gioco usa la **Standard Library**; le richieste a Gemini usano l'SDK ufficiale Google `google-genai`.
 
 ---
 
@@ -42,20 +42,65 @@ Il progetto è sviluppato in **Python 3 puro** utilizzando esclusivamente la **S
 ### Requisiti
 - **Linux / macOS / WSL** (compatibile con qualsiasi terminale ANSI a 256 colori).
 - **Python 3.10+**.
-- **`curl`** installato nel sistema (utilizzato per le chiamate REST a Google Gemini API).
+- **SDK ufficiale Google Gemini** (`google-genai`, installato da `requirements.txt`).
 - Una **Chiave API Google Gemini** (gratuita) ottenibile su [Google AI Studio](https://aistudio.google.com/app/apikey).
 
 ### Installazione
-Non è necessaria alcuna installazione con `pip`! Clona semplicemente il repository:
+Clona il repository e installa la dipendenza Gemini:
 
 ```bash
 git clone https://github.com/nghtcp/Dnd_ScatolaRossa.git
 cd Dnd_ScatolaRossa
+python -m pip install -r requirements.txt
 ```
+
+Se la rete richiede un proxy, impostare `HTTP_PROXY` e `HTTPS_PROXY` nell'ambiente prima di installare le dipendenze e avviare il gioco; `pip` e l'SDK Gemini useranno queste variabili.
 
 ---
 
 ## 🎮 Avvio del Gioco
+
+### Interfaccia web
+
+Per usare il nuovo menu web locale:
+
+```bash
+python dnd_web.py
+```
+
+Il server apre `http://127.0.0.1:8765`; accedi con l'account amministratore oppure con un account creato dall'amministratore. L'amministratore usa `WEB_USERNAME` e `DnD_USER_PASSWORD`; nel pannello Amministrazione può gestire gli account salvati in `utenti_web.json` e aggiornare la chiave Gemini. Gli account giocatore sono protetti con hash e salt, non in chiaro. In locale, se le variabili admin mancano, vengono richieste nel terminale. È possibile passare la chiave API come argomento:
+
+```bash
+python dnd_web.py LA_TUA_CHIAVE_API
+```
+
+L'interfaccia web sostituisce il menu e gli input della console per le operazioni principali:
+
+- login e sessione persistente nel browser; gli account sono creati dall'amministratore;
+- gestione amministrativa degli account nel file `utenti_web.json` e della chiave Gemini;
+- creazione di personaggi associati al proprio account;
+- creazione di avventure e join alle sessioni esistenti usando un proprio personaggio;
+- selezione ed eliminazione delle avventure create dal proprio account;
+- sidebar con riepilogo partita, richiudibile su schermi mobili;
+- pulsante zaino per consultare l'inventario dei membri del party e helper dei comandi web;
+- scelta dei moduli in `moduli_pdf/`;
+- invio delle azioni al DM;
+- consultazione del party e della cronaca.
+
+I comandi `/...` possono essere inviati dalla casella azione della pagina. Il file utenti viene inizializzato con `{"users": []}` e aggiornato dal pannello; gli account contengono `username`, `salt` e `password_hash` scrypt, mai password in chiaro. Crea o reimposta le password dal pannello amministrativo.
+
+### Pubblicazione su Render
+
+Il repository include `render.yaml` per creare un Web Service gratuito. Puoi usarlo come Blueprint oppure impostare manualmente:
+
+- **Build Command:** `python -m compileall -q dnd_web.py dnd_fork.py web_auth.py`
+- **Start Command:** `python dnd_web.py`
+- **Health Check Path:** `/health`
+- **Environment:** `WEB_USERNAME`, `DnD_USER_PASSWORD`, `GEMINI_API_KEY`
+
+Il servizio usa `PORT` fornita da Render e ascolta su `0.0.0.0`. `WEB_USERNAME` identifica l'amministratore e Render genera `DnD_USER_PASSWORD`. L'amministratore crea gli account giocatore dalla pagina Amministrazione; le sessioni attive sono condivise tra account e la cronaca viene aggiornata automaticamente nel browser.
+
+**Persistenza:** sessioni, personaggi, campagne e messaggi sono nel database SQLite `dnd_becmi.db`; gli account giocatore sono nel file `utenti_web.json` e la chiave amministrata nel file protetto `.gemini_api_key`. Il filesystem del piano Free è effimero: questi dati possono andare persi a riavvii o ridistribuzioni. Per conservarli configura uno storage persistente o migra i dati verso un servizio esterno.
 
 Il repository include lo script principale pronto all'uso:
 
@@ -104,7 +149,10 @@ Durante la partita puoi digitare comandi naturali per il DM oppure utilizzare i 
 ## 📁 Struttura del Repository
 
 ```text
-├── dnd-fork.py            # Entry point principale con gestione sicura delle credenziali
+├── dnd-fork.py            # Entry point principale CLI
+├── dnd_web.py             # Entry point del sito web multiplayer
+├── web_auth.py            # Autenticazione, account JSON e appartenenze
+├── utenti_web.json        # Account giocatori (generato/aggiornato dall'admin, ignorato da Git)
 ├── db_manager.py          # Modulo per la gestione del database SQLite
 ├── manuale_comandi_dnd.pdf# Manuale comandi ufficiale pronto per la stampa
 ├── avventure_dnd.json     # Dati iniziali delle avventure predefinite

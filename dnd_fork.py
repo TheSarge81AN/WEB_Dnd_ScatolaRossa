@@ -18,6 +18,9 @@ import zlib
 import hashlib
 from datetime import datetime
 
+from google import genai
+from google.genai import errors, types
+
 DB_FILE = "dnd_becmi.db"
 ADVENTURES_FILE = "avventure_dnd.json"
 MODULI_DIR = "moduli_pdf"
@@ -240,7 +243,7 @@ RANGHI_IMMORTALI = [
 class DnDDatabase:
     def __init__(self, db_path=DB_FILE):
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON;")
         self.conn.execute("PRAGMA journal_mode = WAL;")
@@ -253,6 +256,7 @@ class DnDDatabase:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     nome TEXT NOT NULL UNIQUE,
                     classe TEXT NOT NULL,
+                    razza TEXT NOT NULL DEFAULT 'Umano',
                     livello INTEGER NOT NULL DEFAULT 1,
                     allineamento TEXT NOT NULL DEFAULT 'Legale',
                     immortale INTEGER NOT NULL DEFAULT 0,
@@ -317,6 +321,8 @@ class DnDDatabase:
             if "stato_dungeon_json" not in cols:
                 self.conn.execute("ALTER TABLE avventure ADD COLUMN stato_dungeon_json TEXT DEFAULT '{}'")
             cols_pg = [r["name"] for r in self.conn.execute("PRAGMA table_info(personaggi)").fetchall()]
+            if "razza" not in cols_pg:
+                self.conn.execute("ALTER TABLE personaggi ADD COLUMN razza TEXT NOT NULL DEFAULT 'Umano'")
             if "incantesimi_json" not in cols_pg:
                 self.conn.execute("ALTER TABLE personaggi ADD COLUMN incantesimi_json TEXT DEFAULT '{}'")
 
@@ -333,14 +339,14 @@ class DnDDatabase:
                 pg_id = row["id"]
                 self.conn.execute("""
                     UPDATE personaggi SET
-                        classe = ?, livello = ?, allineamento = ?, immortale = ?,
+                        classe = ?, razza = ?, livello = ?, allineamento = ?, immortale = ?,
                         forza = ?, intelligenza = ?, saggezza = ?, destrezza = ?,
                         costituzione = ?, carisma = ?, pf_attuali = ?, pf_max = ?,
                         ca = ?, mo = ?, pe = ?, ts = ?, attacco = ?,
                         abilita_classe = ?, fascia_becmi = ?, incantesimi_json = ?
                     WHERE id = ?
                 """, (
-                    eroe["classe"], int(eroe["livello"]), eroe["allineamento"], int(bool(eroe.get("immortale", False))),
+                    eroe["classe"], eroe.get("razza", "Umano"), int(eroe["livello"]), eroe["allineamento"], int(bool(eroe.get("immortale", False))),
                     int(eroe["forza"]), int(eroe["intelligenza"]), int(eroe["saggezza"]), int(eroe["destrezza"]),
                     int(eroe["costituzione"]), int(eroe["carisma"]), int(eroe["pf_attuali"]), int(eroe["pf_max"]),
                     int(eroe["ca"]), int(eroe["mo"]), int(eroe["pe"]),
@@ -350,12 +356,12 @@ class DnDDatabase:
             else:
                 cur = self.conn.execute("""
                     INSERT INTO personaggi (
-                        nome, classe, livello, allineamento, immortale,
+                        nome, classe, razza, livello, allineamento, immortale,
                         forza, intelligenza, saggezza, destrezza, costituzione, carisma,
                         pf_attuali, pf_max, ca, mo, pe, ts, attacco, abilita_classe, fascia_becmi, incantesimi_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    eroe["nome"], eroe["classe"], int(eroe["livello"]), eroe["allineamento"], int(bool(eroe.get("immortale", False))),
+                    eroe["nome"], eroe["classe"], eroe.get("razza", "Umano"), int(eroe["livello"]), eroe["allineamento"], int(bool(eroe.get("immortale", False))),
                     int(eroe["forza"]), int(eroe["intelligenza"]), int(eroe["saggezza"]), int(eroe["destrezza"]),
                     int(eroe["costituzione"]), int(eroe["carisma"]), int(eroe["pf_attuali"]), int(eroe["pf_max"]),
                     int(eroe["ca"]), int(eroe["mo"]), int(eroe["pe"]),
@@ -1255,6 +1261,7 @@ def normalizza_personaggio_json(chiave, item):
     car = item.get("caratteristiche") if isinstance(item.get("caratteristiche"), dict) else {}
     item["nome"] = nome
     item.setdefault("classe", base["classe"])
+    item.setdefault("razza", "Umano")
     item.setdefault("livello", 1)
     item.setdefault("allineamento", "Legale")
     item.setdefault("forza", car.get("FOR", base["forza"]))
@@ -1369,6 +1376,16 @@ def migra_json_in_sqlite(db: DnDDatabase):
     return db.carica_tutte_avventure(), db.carica_tutti_personaggi()
 
 
+def _conteggia_scorta(equip: list, pattern: str) -> int:
+    totale = 0
+    for item in equip:
+        if not re.search(pattern, item, re.IGNORECASE):
+            continue
+        quantita = re.search(rf"(\d+)\s+{pattern}\b", item, re.IGNORECASE)
+        totale += int(quantita.group(1)) if quantita else 1
+    return totale
+
+
 def costruisci_system_prompt(eroi_party: list, avventura=None):
     blocco_modulo = ""
     if avventura:
@@ -1401,6 +1418,9 @@ def costruisci_system_prompt(eroi_party: list, avventura=None):
         )
         prep_spells = eroe.get("incantesimi_memorizzati", [])
         spells_str = f" | Incantesimi preparati oggi: {', '.join(prep_spells)}" if prep_spells else ""
+        torce = _conteggia_scorta(eroe["equip"], r"torc(?:ia|e)")
+        razioni = _conteggia_scorta(eroe["equip"], r"razion(?:e|i)")
+        frecce = _conteggia_scorta(eroe["equip"], r"frecce")
         schede_txt.append(
             f"- EROE: {eroe['nome']} ({titolo_livello}, {eroe['allineamento']}) | "
             f"FOR {eroe['forza']} ({mod_caratteristica(eroe['forza']):+d}), "
@@ -1414,7 +1434,7 @@ def costruisci_system_prompt(eroi_party: list, avventura=None):
             f"Equip: {equip_str} | MO: {eroe['mo']} | PE: {eroe['pe']}"
         )
         riquadri_esempio.append(
-            f"[{eroe['nome']} | PF: attuali/{eroe['pf_max']} | CA: {eroe['ca']} | Torce: n | Razioni: n | Frecce: n | MO: n | PE: attuali]"
+            f"[{eroe['nome']} | PF: attuali/{eroe['pf_max']} | CA: {eroe['ca']} | Torce: {torce} | Razioni: {razioni} | Frecce: {frecce} | MO: n | PE: attuali]"
         )
 
     blocco_party = "\n".join(schede_txt)
@@ -1465,6 +1485,9 @@ def costruisci_system_prompt(eroi_party: list, avventura=None):
         "(Basic, Expert, Companion, Master, Immortal - Livelli 1-36 e Ranghi Immortali) in lingua italiana. "
         f"FASCIA DI REGOLAMENTO ATTIVA: {fascia_attiva}. "
         f"GRUPPO DI AVVENTURIERI ({len(eroi_party)} personaggi):\n{blocco_party}\n"
+        "SCORTE INVENTARIO: i conteggi Torce, Razioni e Frecce nei riquadri sono i valori aggiornati e autorevoli. "
+        "Riportali senza ricalcolarli o sottrarli di nuovo in base all'azione di questo turno: il codice gestisce i consumi. "
+        "La torcia attiva e il suo timer sono separati dalle torce di scorta nello zaino; non inventare consumi o quantità.\n"
         f"{blocco_regole_dadi}"
         "3. Risolvi le azioni di tutti i membri del party nel round (sia che agiscano individualmente sia come azione di gruppo). "
         "4. A 0 PF un personaggio muore. Procedi a Turni da 10 minuti ESCLUSIVAMENTE nei dungeon e sotterranei bui (dove le torce durano 6 turni). In taverne, locande, città, botteghe o all'aperto di giorno c'è luce naturale o delle lanterne: le torce NON servono, NON si consumano e NON devono essere accese! 1 MO recuperata = 1 PE. Se il gruppo finisce al buio senza torce in un dungeon buio, applica penalita di -4 al tiro per colpire e alla CA. "
@@ -1719,105 +1742,88 @@ def chiama_gemini(storia, api_key, system_prompt, pdf_path=None, desc_attesa="st
         }
         contents_invio = normalizza_storia_gemini([primo, ponte_dm] + recenti)
 
+    pdf_part = None
     if pdf_path and os.path.exists(pdf_path) and contents_invio:
         if os.path.getsize(pdf_path) <= 18 * 1024 * 1024:
             with open(pdf_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
-            contents_invio[0]["parts"].insert(0, {
-                "inlineData": {
-                    "mimeType": "application/pdf",
-                    "data": b64
-                }
-            })
+                pdf_part = types.Part.from_bytes(data=f.read(), mime_type="application/pdf")
 
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": contents_invio,
-        "generationConfig": {
-            "maxOutputTokens": 8192,
-            "temperature": 0.85
-        }
-    }
-    payload_str = json.dumps(payload)
+    contents = []
+    for index, message in enumerate(contents_invio):
+        parts = []
+        if index == 0 and pdf_part is not None:
+            parts.append(pdf_part)
+        parts.extend(
+            types.Part(text=part["text"])
+            for part in message["parts"]
+            if "text" in part
+        )
+        contents.append(types.Content(role=message["role"], parts=parts))
+
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        max_output_tokens=8192,
+        temperature=0.85,
+    )
 
     ultimo_errore = "Nessun modello disponibile."
     modelli_da_provare = [MODELLO] + [m for m in MODELLI_FALLBACK if m != MODELLO]
 
-    with IndicatoreAttesaDM(desc_attesa):
-        for idx, mod in enumerate(modelli_da_provare):
-            url_completo = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent"
-            for tentativo in range(2):
-                timeout_sec = "18" if tentativo == 0 else "22"
-                comando_curl = [
-                    "curl", "-s", "--max-time", timeout_sec, "-X", "POST",
-                    url_completo,
-                    "-H", "Content-Type: application/json",
-                    "-H", "x-goog-api-key: " + api_key.strip(),
-                    "-d", payload_str
-                ]
+    with genai.Client(
+        api_key=api_key.strip(),
+        http_options=types.HttpOptions(timeout=22_000),
+    ) as client:
+        with IndicatoreAttesaDM(desc_attesa):
+            for idx, mod in enumerate(modelli_da_provare):
+                for tentativo in range(2):
+                    try:
+                        risultato = client.models.generate_content(
+                            model=mod,
+                            contents=contents,
+                            config=config,
+                        )
+                    except errors.APIError as exc:
+                        err_msg = exc.message or str(exc)
+                        err_code = exc.code
+                        ultimo_errore = f"{mod}: {err_msg}"
+                        err_lower = err_msg.lower()
 
-                processo = subprocess.run(comando_curl, capture_output=True, text=True)
-                risposta_grezza = processo.stdout.strip()
+                        if "per day limit" in err_lower or "quota exceeded" in err_lower or "resource_exhausted" in err_lower:
+                            if idx < len(modelli_da_provare) - 1:
+                                prossimo = modelli_da_provare[idx + 1]
+                                print(f"\n{GIALLO}⚠️ Quota esaurita su {mod}. Passaggio automatico al modello di riserva {prossimo}...{RESET}")
+                                MODELLO = prossimo
+                                break
+                            raise Exception(f"Quota giornaliera esaurita su tutti i modelli disponibili. Dettaglio: {err_msg}") from exc
 
-                if not risposta_grezza:
-                    err_det = processo.stderr.strip() if processo.stderr else f"Exit code {processo.returncode}"
-                    ultimo_errore = f"Timeout o risposta vuota dal server ({mod}) [{err_det}]."
-                    if tentativo == 0:
-                        time.sleep(0.8)
-                        continue
-                    else:
-                        # Al secondo tentativo fallito, passa immediatamente al modello successivo
+                        is_transient = err_code == 503 or any(k in err_lower for k in ["high demand", "overloaded", "spikes in demand"])
+                        if is_transient and tentativo == 0:
+                            time.sleep(1.5)
+                            continue
+
                         if idx < len(modelli_da_provare) - 1:
-                            prossimo = modelli_da_provare[idx + 1]
-                            MODELLO = prossimo
+                            MODELLO = modelli_da_provare[idx + 1]
+                            break
+                        raise Exception(err_msg) from exc
+
+                    testo_completo = risultato.text or ""
+                    if not testo_completo:
+                        ultimo_errore = f"Risposta vuota dal modello ({mod})."
+                        if tentativo == 0:
+                            time.sleep(0.8)
+                            continue
+                        if idx < len(modelli_da_provare) - 1:
+                            MODELLO = modelli_da_provare[idx + 1]
                             break
                         continue
 
-                try:
-                    risultato = json.loads(risposta_grezza)
-                except Exception:
-                    ultimo_errore = f"Risposta non valida dal server ({mod})."
-                    break
-
-                if "error" in risultato:
-                    err_msg = risultato["error"].get("message", str(risultato["error"]))
-                    err_code = risultato["error"].get("code", 0)
-                    ultimo_errore = f"{mod}: {err_msg}"
-                    err_lower = err_msg.lower()
-
-                    # Se la quota giornaliera è esaurita (429 per day limit), passa subito al prossimo modello
-                    if "per day limit" in err_lower or "quota exceeded" in err_lower or "resource_exhausted" in err_lower:
-                        if idx < len(modelli_da_provare) - 1:
-                            prossimo = modelli_da_provare[idx + 1]
-                            print(f"\n{GIALLO}⚠️ Quota esaurita su {mod}. Passaggio automatico al modello di riserva {prossimo}...{RESET}")
-                            MODELLO = prossimo
-                            break
-                        else:
-                            raise Exception(f"Quota giornaliera esaurita su tutti i modelli disponibili. Dettaglio: {err_msg}")
-
-                    # Riprova breve solo al primo tentativo se transiente (503 / spike)
-                    is_transient = err_code == 503 or any(k in err_lower for k in ["high demand", "overloaded", "spikes in demand"])
-                    if is_transient and tentativo == 0:
-                        time.sleep(1.5)
-                        continue
-
-                    # Se il modello non è disponibile o fallisce, passa automaticamente al prossimo modello nella catena
-                    if idx < len(modelli_da_provare) - 1:
-                        prossimo = modelli_da_provare[idx + 1]
-                        MODELLO = prossimo
-                        break
-                    else:
-                        raise Exception(err_msg)
-
-                if mod != MODELLO:
-                    MODELLO = mod
-                cand = risultato["candidates"][0]
-                finish_reason = cand.get("finishReason", "")
-                parts = cand.get("content", {}).get("parts", [])
-                testo_completo = "".join(p.get("text", "") for p in parts if "text" in p)
-                if finish_reason == "MAX_TOKENS":
-                    testo_completo += "\n\n[Nota: risposta troncata per limite token del modello]"
-                return testo_completo
+                    candidates = risultato.candidates or []
+                    finish_reason = candidates[0].finish_reason if candidates else None
+                    if str(finish_reason).split(".")[-1] == "MAX_TOKENS":
+                        testo_completo += "\n\n[Nota: risposta troncata per limite token del modello]"
+                    if mod != MODELLO:
+                        MODELLO = mod
+                    return testo_completo
 
     raise Exception(ultimo_errore)
 

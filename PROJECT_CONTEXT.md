@@ -1,97 +1,213 @@
-# Contesto Progetto: D&D BECMI Terminale AI (`dnd-v9_1_5.py`)
+# Contesto progetto: D&D Scatola Rossa
 
-## Architettura attuale (`dnd-v9_1_5.py` v9.1.5)
-- **Linguaggio & Ambiente:** Python 3 su Linux (Debian / MX Linux), interfaccia CLI colorata ANSI con standard library pura (`sqlite3`, `wave`, `struct`, `math`, `shutil`, `re`, `json`, `zlib`).
-- **Backend AI:** Google Gemini via `curl` con timeout esteso (75s/90s), finestra contestuale intelligente (per prevenire ritardi e timeout su storie lunghe), modello primario `gemini-3.6-flash` e catena di fallback automatica (`gemini-3.5-flash`, `gemini-flash-lite-latest`, `gemini-3.1-flash-lite`, `gemini-3.5-flash-lite`, `gemini-3-flash-preview`, `gemini-3.8-flash`, `gemini-3.7-flash`).
-- **Persistenza:** SQLite database relazionale ad alte prestazioni (`dnd_becmi.db`) con migrazione trasparente dai file legacy JSON (`avventure_dnd.json`, `personaggi_dnd.json`). Nuove colonne per stato dungeon (`stato_dungeon_json`) e memoria incantesimi (`incantesimi_json`).
-- **Multiplayer LAN:** Supporto Party multi-giocatore e architettura Server TCP Host / Client per partite in rete locale (porta default 5555).
-- **Sistema Audio Retro-Fantasy (`suoni/`):**
-  - Motore audio asincrono non bloccante via `paplay`, `pw-play`, `aplay` (ALSA/PulseAudio/PipeWire) o beep di riserva.
-  - Sintetizzatore chiptune 8-bit in Python puro (`wave`, `math`, `struct`) che genera automaticamente i file `.wav` mancanti.
-  - Effetti sonori supportati: `dado.wav`, `critico.wav` (20 naturale), `fallimento.wav` (1 naturale), `danno.wav`, `tesoro.wav`, `levelup.wav`, `intro.wav`, `magia.wav`.
-  - Comando `/suoni` (toggle) e `/suoni test` per provare tutti i suoni a video.
-- **Indicatore Attivo del Modello AI:**
-  - Badge e stato del modello visibili nella barra comandi, intestazione del turno e menu principale (`[M] Seleziona Modello`).
-  - Animazione spinner durante l'attesa del DM con modello in evidenza (`🎲 Dungeon Master [AI: gemini-3.8-flash] sta valutando la scena...`).
-- **Logo Intro Ufficiale Rinnovato:**
-  - Drago Rosso alato maestoso in ASCII art con corna dorate, occhi smeraldo luminescenti, zanne e fiamme animate.
-  - Tipografia stilizzata bicolore ad alta visibilità (*DND* in oro, *SCATOLA ROSSA* in rosso cremisi) perfettamente allineata per terminali 80-100 colonne.
-  - Sottotitolo rievocativo dell'Edizione Frank Mentzer (1983) con badge delle funzionalità attive.
+## Scopo
 
-## Sistemi BECMI Implementati (v9.1.5)
-1. **Sistema Magia, Grimorio & Slot (`/magia`, `/lancia`, `/memorizza`):**
-   - Compendio ufficiale BECMI dei cerchi 1-3 sia per incantesimi Arcani (Mago, Elfo) sia Divini (Chierico, Druido, Paladino) con 36 incantesimi registrati.
-   - Calcolo dinamico degli slot per livello di classe secondo le tabelle della Scatola Rossa / Blu.
-   - Tracciamento slot usati e memorizzazione personalizzata.
-   - Comando `/lancia <nome incantesimo>` con effetto sonoro dedicato `magia.wav` e deduzione automatica degli slot.
-2. **Tempo del Dungeon, Illuminazione, Torce & Buio Totale (`/torcia`, `/ambiente`):**
-   - Calcolo tempo a turni esplorativi di 10 minuti (con indicatore orario Hh MMm in testata).
-   - **Illuminazione Ambientale Intelligente:** Riconosce automaticamente luoghi illuminati (taverne, locande, botteghe, città, villaggi, piazze, all'aperto di giorno con luce solare) sia dalla narrazione del DM che dalle azioni del giocatore. In questi ambienti le torce personali vanno in pausa, non consumano turni e non vengono mai consumate inutilmente dagli zaini.
-   - **Gestione Naturale delle Torce:** Riconosce comandi in linguaggio naturale per spegnere e riporre le torce nello zaino (es. *"spegni la torcia"*, *"spengo la torcia e mi siedo"*, *"mettiamo via le torce"*) o per riaccenderle (*"accendi la torcia"*, *"estraggo una torcia"*).
-   - **Nessuna Auto-accensione Indesiderata:** Se una torcia viene spenta volontariamente o se ci si trova in un luogo illuminato, il sistema non brucia mai torce di riserva dall'inventario.
-   - **Comando `/torcia [on|off|auto]` & `/ambiente [tipo]`:** Menu completo per accendere, spegnere/riporre, gestire le scorte, attivare/disattivare l'auto-sostituzione a fine durata, o forzare/ispezionare l'ambiente di gioco (taverna, città, dungeon, auto).
-   - Countdown di 6 turni per torcia (60 min) attivo esclusivamente nei dungeon bui con avviso di tremolio al 1° turno.
-   - Condizione di Buio Totale automatica all'esaurimento con penalità BECMI (-4 al TxC, -4 alla CA) iniettata nel prompt del DM.
-   - **Incontri Erranti Bilanciati (`/incontri`):** Frequenza regolabile con comando `/incontri [raro|normale|frequente|off]`. Il nuovo default ("Raro / Bilanciato") esegue il controllo ogni 4 turni (40 min) tirando 1 su 1d8 (~12.5%) con cooldown obbligatorio di almeno 4 turni per evitare incontri a raffica. Disattivato in locande, città e alla luce del sole. Niente mostri casuali durante il riposo in locanda.
-3. **Riposo & Guarigione Naturale (`/riposo`):**
-   - Riposo breve (10 min) per riorganizzare il party.
-   - Riposo lungo (8 ore) che consuma una razione di cibo dallo zaino, ripristina 1d3 PF secondo le regole BECMI e rigenera al 100% tutti gli slot incantesimi.
-   - Tiro automatico per mostri erranti notturni con risveglio immediato se l'accampamento viene interrotto.
-4. **Tabelle Reazione & Morale Mostri (2d6 BECMI):**
-   - Batteria dadi arricchita con tiro 2d6 Reazione (2 = Attacco immediato/feroce, 3-5 = Ostile, 6-8 = Incerto, 9-11 = Neutrale/Cauto, 12 = Amichevole/Aperto al dialogo).
-   - Tiro 2d6 Morale dei mostri a disposizione del DM per verificare se i nemici fuggono o si arrendono.
-5. **Esportazione Cronaca dell'Avventura (`/esporta`):**
-   - Esporta la storia completa, le schede dei personaggi, le note del diario e le statistiche dell'avventura in un documento Markdown formattato salvato nella cartella `cronache/`.
-6. **Mappa Tattica A4 PDF per la Campagna (`/mappa pdf`, `/mappapdf`, `/esporta mappa`):**
-   - Generatore PDF 1.4 vettoriale nativo in Python puro standard library con FlateDecode compression (zero librerie terze).
-   - Formato A4 perfetto per stampa o visualizzazione su tablet/schermo al tavolo da gioco (ISO 210 x 297 mm).
-   - **Pagina 1 (Mappa Tattica)**:
-     - Doppia cornice decorativa Scatola Rossa (cremisi e oro).
-     - Intestazione con titolo avventura, party, livello, turno, tempo trascorso e stato torce.
-     - Griglia blueprint a quadretti 10 piedi / 3 metri (stile TSR classico).
-     - Rendering vettoriale: muri spessi in pietra con giunzioni, pavimentazione stanze, corridoi lastricati, porte in legno, porte segrete ('S'), porte aperte ('/'), token Party ('P' rosso), pericoli/trappole ('!'), tesori ('$'), badge numerati stanze.
-     - Rosa dei venti (indicatore Nord) e barra di scala.
-     - Legenda numerata con titoli e descrizioni delle stanze.
-     - Segni convenzionali e appunti di spedizione.
-   - **Pagina 2 (Dossier Ambientale & Registro di Esplorazione)**:
-     - Griglia cartografica ASCII originale in riquadro terminale retro.
-     - Scheda Roster Compagnia con PF, CA, attacchi, MO e slot incantesimi.
-     - Dossier descrittivo approfondito degli ambienti visitati.
-     - Righe tratteggiate per annotazioni a penna fisiche durante le sessioni di campagna.
-   - Salvataggio automatico nella cartella dedicata `mappe/`.
-7. **Schede Personaggio Ufficiali in PDF A4 (`/scheda pdf`, `/schedapdf`, `/esporta scheda`, Menu `[P]`):**
-   - Esportazione vettoriale A4 ad alta definizione salvata nella cartella dedicata `schede/` con grafica e colori originali TSR Scatola Rossa (rosso cremisi e oro).
-   - 6 caratteristiche base (FOR, INT, SAG, DES, COS, CAR) con punteggio, modificatori BECMI (-3..+3) e note esplicative.
-   - Riquadri di combattimento ad alto impatto visivo: Punti Ferita (PF attuali e max con dado vita), Classe Armatura (CA con armatura/scudo equipaggiati), Attacco & THAC0 con bonus TxC corpo a corpo e a distanza.
-   - Box dedicato per i 5 Tiri Salvezza BECMI (Raggio Morte/Veleno, Bacchette Magiche, Paralisi/Pietrificazione, Soffio di Drago, Bastoni/Incantesimi) calcolati dinamicamente per classe e livello.
-   - Privilegi e abilità speciali di classe formattati su righe multiple.
-   - Borsello (MO ed equivalenze monetarie BECMI), velocità di movimento (esplorazione 60', combattimento 20', corsa 60') e regole di riposo/guarigione.
-   - Layout adattivo intelligente: per gli incantatori (Mago, Elfo, Chierico, Druido, Paladino) visualizza il grimorio con gli slot giornalieri per cerchio e gli incantesimi preparati; per i combattenti/non-incantatori riserva l'intero riquadro all'equipaggiamento esteso e armi.
-   - Riquadro inferiore con righe per annotazioni a penna durante le sessioni al tavolo.
-   - Accessibile durante il gioco con `/scheda pdf`, `/esporta scheda`, dal menu principale con l'opzione `[P]` (stampa singolo PG o party completo), e offerto automaticamente subito dopo la creazione di un eroe.
-8. **Manuale dei Comandi & Guida di Gioco PDF A4 con Auto-Sincronizzazione (`manuale_comandi_dnd.pdf`, `/help pdf`, Menu `[G]`):**
-   - Guida completa e compatta su 2 pagine A4 suddivisa in 7 sezioni tematiche:
-     1. Azioni del Party & Comandi Base
-     2. Tempo del Dungeon, Illuminazione, Torce & Buio Totale
-     3. Sistema Magia, Grimorio, Slot & Lancio Incantesimi
-     4. Combattimento, Tiri Dado Reali & Reazioni/Morale BECMI
-     5. Gestione Eroi, Livello & Schede Personaggio PDF A4
-     6. Cartografia del Dungeon & Mappe A4 PDF
-     7. Audio Retro, Modello AI, Multiplayer LAN & Comandi di Sistema
-   - **Meccanismo di Auto-Sincronizzazione Intelligente:** calcola l'impronta crittografica MD5 dei comandi e della guida (`.manuale_hash`). Ad ogni avvio del programma in `main()`, verifica l'hash: se i comandi o il testo di help subiscono modifiche o se il file manca, il documento PDF viene immediatamente rigenerato senza rallentamenti.
-   - Può essere rigenerato o consultato in qualsiasi momento con il comando `/help pdf` (o `/comandi pdf`) in sessione o premendo `[G]` dal menu principale.
-9. **Modalità di Gioco Interattiva con Chiamata Dadi DM (Menu `[I]`, `/modalita`):**
-   - Scelta tra due modalità di esperienza al tavolo:
-     - **Modalità Interattiva (Predefinita & Consigliata):** Il Dungeon Master AI descrive la scena fino al punto culminante e, di fronte a un'azione incerta (attacco, TS, prova abilità/scasso/trappole), **non tira mai i dadi per i giocatori né auto-risolve l'esito**. Emette invece una chiamata esplicita: `[CHIAMATA DADO: NomePG - Tira <formula> per <scopo> (vs Soglia/CA <valore>)]` e si ferma in attesa del tiro reale del giocatore.
-     - **Modalità Classica / Continua:** Il DM AI e il motore tirano direttamente i dadi (inclusi autodadi) e narrano subito esito e conseguenze in modo continuo.
-   - **Riconoscimento Automatico Tiri Reali:** Il giocatore può comunicare il proprio tiro lanciando dadi fisici al tavolo e digitando semplicemente il numero ottenuto (es. `16`, `ho fatto 15`, `tiro 14`), oppure digitando `/d20`, `/d8+1`, ecc. Il sistema wrappa il tiro in `[TIRO REALE: ...]` e il DM calcola la formula `[NomePG - Prova: Dado +/- mod = Totale vs Soglia -> Esito]`. In caso di colpo a segno, il DM procede chiedendo separatamente il tiro per i danni.
-   - **UI & Indicatore Visivo:** Banner retro dorato e rosso in evidenza quando il DM è in attesa di un dado (`🎲 IL DM ATTENDE IL TUO TIRO: ...`), con prompt personalizzato `[NomePG - TIRO DADO] > ` e badge dedicato in testata (`🎲 Interattiva` / `🎲 Classica`).
-   - **Controllo e Persistenza:** Menu dedicato `[I]` nel menu principale, scelta guidata alla creazione di nuove avventure, comando in-game `/modalita [interattiva|classica]`, e salvataggio permanente in SQLite (`stato_dungeon_json`).
-10. **Gestione Inventario & Zaino Dedicata (`/inventario`, `/zaino`, `/equip`):**
-   - Schermata di consultazione rapida che suddivide automaticamente gli oggetti in:
-     - ⚔️ **Armi & Munizioni** (con danni e proprietà)
-     - 🛡️ **Armatura & Protezione** (con CA risultante)
-     - 🎒 **Zaino & Attrezzatura da Avventura** (torce, razioni, corde, attrezzi)
-     - 💰 **Borsello & Tesori** (monete d'oro individuali e totali di compagnia)
-   - Supporto per visualizzazione singolo personaggio (`/inventario <nome>`) o riepilogo collettivo dell'intero gruppo (`/inventario party` o `/inventario tutti`).
-   - Inserito nella barra rapida dei comandi in testata e nella guida comandi `/help`.
+Applicazione Python da terminale che usa Google Gemini come Dungeon Master per campagne basate sulle regole storiche D&D BECMI. Il repository contiene un gioco CLI completo, persistenza locale SQLite, mappe e schede in PDF generati nativamente, effetti sonori, moduli PDF di avventura e partita LAN TCP.
+
+La priorita operativa per modifiche future e mantenere la coerenza con il codice reale, distinguendo chiaramente il punto d'ingresso principale dalle copie storiche.
+
+## Stato reale del repository
+
+- Entry point principale documentato: `dnd-fork.py`.
+- Alias locale identico: `dnd_fork.py` (stesso contenuto di `dnd-fork.py`).
+- Versione monolitica precedente equivalente: `dnd.py` e `dnd-v9_1_5.py` (stesso contenuto).
+- `dnd-fork.py` e la variante piu recente: aggiunge gestione chiave Gemini da file locale, variabile d'ambiente, argomento CLI e menu `[K]`.
+- `dnd-v9_1_5.py`, `dnd.py`, `dnd-v9_1_4.py`, `dnd-v9_1_3.py`, `dnd-v9_1.py`, `dnd-v9_0.py` e `dnd_legacy_pre915.py` sono snapshot storici, non moduli da importare.
+- `db_manager.py` e un modulo SQLite autonomo/demo separato dal motore persistente interno a `dnd-fork.py`. Non viene importato dagli entry point verificati.
+- `requirements.txt` dichiara l'SDK ufficiale `google-genai`; il resto del motore usa la standard library Python.
+- Tutti i file Python principali compilano con `python -m compileall`.
+- Non sono presenti database SQLite nel repository allo stato iniziale: sono dati generati/runtime e ignorati da Git.
+
+## Avvio
+
+```bash
+python dnd-fork.py
+python dnd-fork.py LA_CHIAVE_GEMINI
+python dnd-fork.py --join IP_HOST
+```
+
+## Interfaccia web
+
+Il file `dnd_web.py` espone l'interfaccia su `http://127.0.0.1:8765` in locale e si adatta a `PORT`/`0.0.0.0` su Render.
+
+```bash
+python dnd_web.py
+python dnd_web.py LA_CHIAVE_GEMINI
+```
+
+La pagina usa API HTTP JSON sulla stessa sorgente `dnd_becmi.db` e riusa funzioni di `dnd-fork.py` per personaggi, avventure, Gemini, comandi e PDF. `web_auth.py` gestisce account, hash password, cookie di sessione, proprietà personaggi e appartenenza alle avventure. Funzionalita web:
+
+- login con cookie HttpOnly, logout e provisioning account riservato all'amministratore;
+- gestione account in `utenti_web.json` con hash/salt scrypt, reimpostazione password e revoca degli account;
+- pagina amministrativa per chiave Gemini e gestione account;
+- personaggi associati all'account che li crea;
+- elenco delle avventure condivise e join con un personaggio proprio;
+- azioni e risposte Gemini salvate in SQLite e visualizzate dagli altri partecipanti tramite polling ogni 2,5 secondi;
+- azioni concorrenti serializzate per singola avventura per preservare l'ordine del transcript;
+- eliminazione consentita solo al creatore dell'avventura;
+- selezione modulo PDF, inventario, comandi slash, cronaca e riepilogo party.
+
+L'amministratore è identificato da `WEB_USERNAME` e `DnD_USER_PASSWORD`; su Render la password è generata dal Blueprint. Solo l'amministratore può creare, aggiornare ed eliminare account nella pagina admin. Gli account giocatore sono definiti in `utenti_web.json` con salt/hash scrypt, mai con password in chiaro. La stessa pagina aggiorna la chiave Gemini salvandola nel file protetto `.gemini_api_key`; una chiave salvata ha precedenza su `GEMINI_API_KEY`. Gli endpoint di gioco richiedono un account autenticato; `/health` resta pubblico e i cookie su Render sono marcati `Secure`.
+
+Account, associazioni, avventure e transcript sono conservati nel DB SQLite. Il filesystem del piano Free è effimero: dati e account possono essere persi a riavvii/redeploy; serve storage persistente per conservarli. La migrazione JSON viene tentata all'avvio per inizializzare un DB vuoto.
+
+Per il motore CLI la chiave viene risolta nell'ordine: argomento CLI, `GEMINI_API_KEY`, `.gemini_api_key`, richiesta interattiva. Per `dnd_web.py` l'argomento CLI ha precedenza; altrimenti `.gemini_api_key` salvata dal pannello admin precede `GEMINI_API_KEY`. Il file chiave usa permessi Unix `0600` dove supportato; `utenti_web.json` è ignorato da Git.
+
+## Architettura
+
+Il programma e prevalentemente monolitico: configurazione, modelli dati, SQLite, chiamate REST, UI ANSI, audio, PDF, LAN e loop di gioco stanno nel singolo entry point. La separazione logica e ottenuta tramite classi e funzioni.
+
+### Flusso principale
+
+1. `main()` richiede/risolve la chiave API.
+2. `DnDDatabase` apre `dnd_becmi.db`, abilita foreign key e WAL, crea o migra lo schema.
+3. `migra_json_in_sqlite()` migra i dati legacy dal JSON alla prima esecuzione.
+4. `menu_principale()` permette creazione/caricamento avventure, personaggi, LAN e utility.
+5. `esegui_sessione()` gestisce turni, comandi slash, chiamate Gemini, dadi, torce, riposo, magia e salvataggi.
+6. Ogni nuova avventura o personaggio viene conservato nel database; i file JSON restano sorgenti legacy/seme.
+
+### Persistenza SQLite principale
+
+Database: `dnd_becmi.db`
+
+Tabelle principali definite in `DnDDatabase`:
+
+- `personaggi`: statistiche BECMI, PF, CA, PE, allineamenti, incantesimi JSON e campi di stato.
+- `inventario`: oggetti collegati al personaggio con eliminazione a cascata.
+- `avventure`: titolo, eroe, party JSON, modulo PDF/testo e stato dungeon JSON.
+- `messaggi_storia`: transcript ordinato della conversazione per avventura.
+- `diario_note`: note di campagna.
+
+Indici:
+
+- `idx_msg_avventura`
+- `idx_inv_pg`
+- `idx_note_avv`
+
+Migrazioni compatibili all'avvio:
+
+- `party_json`
+- `stato_dungeon_json`
+- `incantesimi_json`
+
+Le colonne JSON sono stringhe serializzate SQLite, da trattare come payload Python dopo `json.loads()`.
+
+### Dati legacy
+
+- `avventure_dnd.json`: avventure pregenerate o salvate nello storico formato JSON.
+- `personaggi_dnd.json`: personaggi pregenerati/storici.
+- `salvataggio_dnd.json`: vecchio snapshot della storia di gioco.
+- `diario_avventura.txt`: diario legacy.
+
+Il database ha priorita una volta migrato. Evitare modifiche alla migrazione senza testare dati gia esistenti.
+
+## Sistemi implementati
+
+- Regole BECMI: 9 classi includendo le estensioni Druido e Paladino, livelli fino al 36°, fasce Basic/Expert/Companion/Master/Immortal, THAC0, attacchi, tiri salvezza e XP.
+- Classe, slot, grimorio e memorizzazione incantesimi.
+- Tempo di dungeon a turni da 10 minuti, torce, ambienti illuminati e buio totale.
+- Il prompt Gemini include i conteggi correnti di torce, razioni e frecce; le scorte salvate sono autorevoli e non vanno ricalcolate dal modello.
+- Riposo breve/lungo e recupero PF.
+- Reazione 2d6 e morale mostri.
+- Mostri erranti con frequenza configurabile e cooldown.
+- Modalita interattiva con chiamata dadi reali; modalita classica con autodadi.
+- Party locale e host/client LAN sulla porta `5555`.
+- Audio 8-bit con sintesi `.wav` se mancanti.
+- Gemini tramite SDK ufficiale Python, con elenco di modelli fallback.
+- PDF: schede personaggio, mappe tattiche/dossier e manuale comandi.
+- Esportazione cronache Markdown.
+- Controllo automatico hash/manuale PDF all'avvio.
+
+## Struttura repository
+
+```text
+dnd-fork.py                 Entry point principale CLI
+dnd_fork.py                 Alias esatto del punto d'ingresso CLI
+dnd.py / dnd-v9_1_5.py      Copia storica della versione precedente
+dnd_web.py                  Entry point dell'interfaccia web e deploy Render
+web_auth.py                 Account JSON, sessioni e partecipazione web
+utenti_web.json              Account giocatori runtime (ignorato da Git)
+db_manager.py               Database demo indipendente non usato dal gioco
+avventure_dnd.json          Seed/migrazione avventure legacy
+personaggi_dnd.json         Seed/migrazione personaggi legacy
+salvataggio_dnd.json        Snapshot legacy
+manuale_comandi_dnd.pdf     Manuale generato
+moduli_pdf/                 Moduli PDF importabili
+cronache/                   Cronache Markdown generate
+mappe/                      Mappe A4 PDF generate
+schede/                     Schede A4 PDF generate
+suoni/                      Effetti WAV
+PROJECT_CONTEXT.md          Questo documento
+README.md                   Installazione e guida utente
+.gitignore                  Credenziali, DB e output ignorati
+```
+
+## File principali da modificare
+
+Per nuove funzionalita di gioco modificare prima `dnd-fork.py`. Aggiornare `dnd-fork.py` e `dnd_fork.py` solo se si vuole mantenere l'alias identico: al momento sono copie byte-identiche.
+
+Non propagare modifiche agli snapshot `dnd-v9_*.py` salvo una migrazione/versioning esplicitamente richiesta.
+
+`db_manager.py` descrive uno schema diverso da quello del gioco principale. Non presumere che metodi o tabelle siano condivisi.
+
+## Integrazione Gemini
+
+- Richieste inviate con `google-genai` tramite `client.models.generate_content()`.
+- La chiave viene passata dal chiamante al client SDK; non viene stampata nei log.
+- Sono mantenuti cronologia, istruzioni di sistema, configurazione di generazione e PDF inline.
+- L'SDK usa le variabili standard `HTTP_PROXY`/`HTTPS_PROXY` se presenti nell'ambiente.
+- Il prompt di sistema e costruito da `costruisci_system_prompt()`.
+- La storia usa il formato Gemini `role/user|model` con blocchi `parts[].text`.
+- Sono presenti normalizzazioni di fallback dei contenuti restituiti e fallback tra modelli.
+- La finestra/cronologia puo essere compressa per evitare prompt troppo grandi.
+- Timeout, retry API e fallback modelli sono configurati in `chiama_gemini()`.
+- Le chiamate non devono mai essere effettuate con una chiave segreta in log, screenshot o output.
+
+## Comandi e convenzioni
+
+- Comandi utente in-game: prefisso `/` (`/help`, `/inventario`, `/torcia`, `/magia`, `/lancia`, `/riposo`, `/scheda`, `/mappa`, `/modalita`, `/incontri`, `/suoni`, `/esporta`).
+- Lingua interna dei testi: italiano.
+- Output terminale: codici ANSI; usare le costanti `VERDE`, `GIALLO`, `CIANO`, `ROSSO`, `MAGENTA`, `GRASSETTO`, `DIM`, `RESET`.
+- I dati personaggio restano dizionari Python serializzati in SQLite/JSON.
+- Stati temporali di avventura vanno preferibilmente in `stato_dungeon_json`, incantesimi in `incantesimi_json`.
+- PDF generati sono vettoriali e basati su `zlib`, stream PDF e font/posizionamenti nativi del programma.
+
+## Audio
+
+Cartella `suoni/`. Il motore prova prima player disponibili (`paplay`, `pw-play`, `aplay`) e crea WAV sintetici quando i file mancano. Su Windows le chiamate Linux possono non essere disponibili: il fallback deve restare non bloccante e l'esperienza in terminale Windows non deve dipendere dall'audio.
+
+## LAN
+
+- Host: server TCP locale, porta default `5555`.
+- Client: avviabile con menu o `python dnd-fork.py --join IP`.
+- Il protocollo scambia dizionari Python serializzati come pacchetti JSON.
+- Operazioni LAN devono preservare il database dell'host come fonte autorevole.
+
+## Requisiti pratici
+
+- Python 3.10 o superiore suggerito.
+- `google-genai>=1.75.0,<2.0.0` installato da `requirements.txt` (compatibile con Python 3.10+).
+- Terminale con supporto ANSI consigliato.
+- `curl` non è richiesto per le chiamate Gemini.
+- Su Windows usare Python nel terminale con percorsi in backslash ed evitare dipendenze Unix non guardate.
+
+## Validazione attuale
+
+Verifica minima:
+
+```bash
+python -m compileall dnd-fork.py dnd_fork.py dnd.py dnd-v9_1_5.py db_manager.py dnd_web.py web_auth.py
+```
+
+Non esiste uno script ufficiale di test. Per una modifica mirata, creare o usare uno snippet diretto che eserciti la funzione modificata senza avviare Gemini o una partita interattiva. I test devono coprire: migrazioni SQLite, salvataggi JSON, calcoli BECMI, parsing comandi/dadi, generazione PDF e timeout/fallback API.
+
+## Precauzioni per agenti
+
+- Partire da `dnd-fork.py`, non dagli snapshot storici.
+- Usare `apply_patch`/patch chirurgici nel file principale.
+- Mantenere compatibile SQLite e i dati JSON gia presenti.
+- Non registrare o committare `.gemini_api_key`, `dnd_becmi.db`, export, PDF runtime o WAL.
+- Verificare sempre sintassi prima e dopo modifiche.
+- Usare l'SDK Google dichiarato in `requirements.txt` per le chiamate Gemini; evitare altre dipendenze non necessarie.
+- Quando si aggiunge un comando slash, aggiornare: parser/comando in-game, `HELP_TESTO`, hash/manuale PDF e README se la feature e visibile all'utente.
+- Quando si modifica la persistenza, aggiungere migrazione compatibile in `_crea_schema()` e verificare righe gia esistenti.

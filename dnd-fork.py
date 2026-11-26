@@ -18,6 +18,9 @@ import zlib
 import hashlib
 from datetime import datetime
 
+from google import genai
+from google.genai import errors, types
+
 DB_FILE = "dnd_becmi.db"
 ADVENTURES_FILE = "avventure_dnd.json"
 MODULI_DIR = "moduli_pdf"
@@ -240,7 +243,7 @@ RANGHI_IMMORTALI = [
 class DnDDatabase:
     def __init__(self, db_path=DB_FILE):
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON;")
         self.conn.execute("PRAGMA journal_mode = WAL;")
@@ -1719,105 +1722,88 @@ def chiama_gemini(storia, api_key, system_prompt, pdf_path=None, desc_attesa="st
         }
         contents_invio = normalizza_storia_gemini([primo, ponte_dm] + recenti)
 
+    pdf_part = None
     if pdf_path and os.path.exists(pdf_path) and contents_invio:
         if os.path.getsize(pdf_path) <= 18 * 1024 * 1024:
             with open(pdf_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
-            contents_invio[0]["parts"].insert(0, {
-                "inlineData": {
-                    "mimeType": "application/pdf",
-                    "data": b64
-                }
-            })
+                pdf_part = types.Part.from_bytes(data=f.read(), mime_type="application/pdf")
 
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": contents_invio,
-        "generationConfig": {
-            "maxOutputTokens": 8192,
-            "temperature": 0.85
-        }
-    }
-    payload_str = json.dumps(payload)
+    contents = []
+    for index, message in enumerate(contents_invio):
+        parts = []
+        if index == 0 and pdf_part is not None:
+            parts.append(pdf_part)
+        parts.extend(
+            types.Part(text=part["text"])
+            for part in message["parts"]
+            if "text" in part
+        )
+        contents.append(types.Content(role=message["role"], parts=parts))
+
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        max_output_tokens=8192,
+        temperature=0.85,
+    )
 
     ultimo_errore = "Nessun modello disponibile."
     modelli_da_provare = [MODELLO] + [m for m in MODELLI_FALLBACK if m != MODELLO]
 
-    with IndicatoreAttesaDM(desc_attesa):
-        for idx, mod in enumerate(modelli_da_provare):
-            url_completo = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent"
-            for tentativo in range(2):
-                timeout_sec = "18" if tentativo == 0 else "22"
-                comando_curl = [
-                    "curl", "-s", "--max-time", timeout_sec, "-X", "POST",
-                    url_completo,
-                    "-H", "Content-Type: application/json",
-                    "-H", "x-goog-api-key: " + api_key.strip(),
-                    "-d", payload_str
-                ]
+    with genai.Client(
+        api_key=api_key.strip(),
+        http_options=types.HttpOptions(timeout=22_000),
+    ) as client:
+        with IndicatoreAttesaDM(desc_attesa):
+            for idx, mod in enumerate(modelli_da_provare):
+                for tentativo in range(2):
+                    try:
+                        risultato = client.models.generate_content(
+                            model=mod,
+                            contents=contents,
+                            config=config,
+                        )
+                    except errors.APIError as exc:
+                        err_msg = exc.message or str(exc)
+                        err_code = exc.code
+                        ultimo_errore = f"{mod}: {err_msg}"
+                        err_lower = err_msg.lower()
 
-                processo = subprocess.run(comando_curl, capture_output=True, text=True)
-                risposta_grezza = processo.stdout.strip()
+                        if "per day limit" in err_lower or "quota exceeded" in err_lower or "resource_exhausted" in err_lower:
+                            if idx < len(modelli_da_provare) - 1:
+                                prossimo = modelli_da_provare[idx + 1]
+                                print(f"\n{GIALLO}⚠️ Quota esaurita su {mod}. Passaggio automatico al modello di riserva {prossimo}...{RESET}")
+                                MODELLO = prossimo
+                                break
+                            raise Exception(f"Quota giornaliera esaurita su tutti i modelli disponibili. Dettaglio: {err_msg}") from exc
 
-                if not risposta_grezza:
-                    err_det = processo.stderr.strip() if processo.stderr else f"Exit code {processo.returncode}"
-                    ultimo_errore = f"Timeout o risposta vuota dal server ({mod}) [{err_det}]."
-                    if tentativo == 0:
-                        time.sleep(0.8)
-                        continue
-                    else:
-                        # Al secondo tentativo fallito, passa immediatamente al modello successivo
+                        is_transient = err_code == 503 or any(k in err_lower for k in ["high demand", "overloaded", "spikes in demand"])
+                        if is_transient and tentativo == 0:
+                            time.sleep(1.5)
+                            continue
+
                         if idx < len(modelli_da_provare) - 1:
-                            prossimo = modelli_da_provare[idx + 1]
-                            MODELLO = prossimo
+                            MODELLO = modelli_da_provare[idx + 1]
+                            break
+                        raise Exception(err_msg) from exc
+
+                    testo_completo = risultato.text or ""
+                    if not testo_completo:
+                        ultimo_errore = f"Risposta vuota dal modello ({mod})."
+                        if tentativo == 0:
+                            time.sleep(0.8)
+                            continue
+                        if idx < len(modelli_da_provare) - 1:
+                            MODELLO = modelli_da_provare[idx + 1]
                             break
                         continue
 
-                try:
-                    risultato = json.loads(risposta_grezza)
-                except Exception:
-                    ultimo_errore = f"Risposta non valida dal server ({mod})."
-                    break
-
-                if "error" in risultato:
-                    err_msg = risultato["error"].get("message", str(risultato["error"]))
-                    err_code = risultato["error"].get("code", 0)
-                    ultimo_errore = f"{mod}: {err_msg}"
-                    err_lower = err_msg.lower()
-
-                    # Se la quota giornaliera è esaurita (429 per day limit), passa subito al prossimo modello
-                    if "per day limit" in err_lower or "quota exceeded" in err_lower or "resource_exhausted" in err_lower:
-                        if idx < len(modelli_da_provare) - 1:
-                            prossimo = modelli_da_provare[idx + 1]
-                            print(f"\n{GIALLO}⚠️ Quota esaurita su {mod}. Passaggio automatico al modello di riserva {prossimo}...{RESET}")
-                            MODELLO = prossimo
-                            break
-                        else:
-                            raise Exception(f"Quota giornaliera esaurita su tutti i modelli disponibili. Dettaglio: {err_msg}")
-
-                    # Riprova breve solo al primo tentativo se transiente (503 / spike)
-                    is_transient = err_code == 503 or any(k in err_lower for k in ["high demand", "overloaded", "spikes in demand"])
-                    if is_transient and tentativo == 0:
-                        time.sleep(1.5)
-                        continue
-
-                    # Se il modello non è disponibile o fallisce, passa automaticamente al prossimo modello nella catena
-                    if idx < len(modelli_da_provare) - 1:
-                        prossimo = modelli_da_provare[idx + 1]
-                        MODELLO = prossimo
-                        break
-                    else:
-                        raise Exception(err_msg)
-
-                if mod != MODELLO:
-                    MODELLO = mod
-                cand = risultato["candidates"][0]
-                finish_reason = cand.get("finishReason", "")
-                parts = cand.get("content", {}).get("parts", [])
-                testo_completo = "".join(p.get("text", "") for p in parts if "text" in p)
-                if finish_reason == "MAX_TOKENS":
-                    testo_completo += "\n\n[Nota: risposta troncata per limite token del modello]"
-                return testo_completo
+                    candidates = risultato.candidates or []
+                    finish_reason = candidates[0].finish_reason if candidates else None
+                    if str(finish_reason).split(".")[-1] == "MAX_TOKENS":
+                        testo_completo += "\n\n[Nota: risposta troncata per limite token del modello]"
+                    if mod != MODELLO:
+                        MODELLO = mod
+                    return testo_completo
 
     raise Exception(ultimo_errore)
 
