@@ -401,6 +401,31 @@ class WebAuthStore:
 				(user_id, character_name)
 			)
 
+	def update_character_adventures(self, user_id, replacements, character_name):
+		with self._connect() as conn:
+			members = {
+				row["adventure_id"] for row in conn.execute(
+					"SELECT adventure_id FROM web_adventure_members WHERE user_id = ?",
+					(user_id,)
+				).fetchall()
+			}
+			for adventure_id, replacement in replacements.items():
+				if adventure_id not in members:
+					continue
+				if replacement:
+					conn.execute(
+						"INSERT INTO web_adventure_member_characters (adventure_id, user_id, character_name) VALUES (?, ?, ?) "
+						"ON CONFLICT(adventure_id, user_id) DO UPDATE SET character_name = excluded.character_name",
+						(adventure_id, user_id, replacement)
+					)
+				else:
+					conn.execute("DELETE FROM web_adventure_member_characters WHERE adventure_id = ? AND user_id = ?", (adventure_id, user_id))
+					conn.execute("DELETE FROM web_adventure_members WHERE adventure_id = ? AND user_id = ?", (adventure_id, user_id))
+			conn.execute(
+				"DELETE FROM web_character_owners WHERE user_id = ? AND character_name = ? COLLATE NOCASE",
+				(user_id, character_name)
+			)
+
 	def add_member(self, user_id, adventure_id):
 		with self._connect() as conn:
 			conn.execute(
@@ -462,7 +487,12 @@ class WebAuthStore:
 		return row is not None
 
 	def remove_adventure(self, adventure_id):
+		self.remove_adventures([adventure_id])
+
+	def remove_adventures(self, adventure_ids):
+		ids = [(adventure_id,) for adventure_id in adventure_ids]
+		if not ids:
+			return
 		with self._connect() as conn:
-			conn.execute("DELETE FROM web_adventure_member_characters WHERE adventure_id = ?", (adventure_id,))
-			conn.execute("DELETE FROM web_adventure_members WHERE adventure_id = ?", (adventure_id,))
-			conn.execute("DELETE FROM web_adventure_owners WHERE adventure_id = ?", (adventure_id,))
+			for table in ("web_adventure_member_characters", "web_adventure_members", "web_adventure_owners"):
+				conn.executemany(f"DELETE FROM {table} WHERE adventure_id = ?", ids)

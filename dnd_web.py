@@ -440,7 +440,13 @@ class WebHandler(BaseHTTPRequestHandler):
             if not self.require_admin():
                 return
             try:
-                json_response(self, 200, {"users": AUTH_STORE.list_users(), "api_key": api_key_status()})
+                with LOCK:
+                    adventures = DB.carica_sommario_avventure()
+                json_response(self, 200, {
+                    "users": AUTH_STORE.list_users(),
+                    "api_key": api_key_status(),
+                    "adventures": adventures
+                })
             except (OSError, ValueError) as exc:
                 json_response(self, 500, {"error": str(exc)})
             return
@@ -526,13 +532,28 @@ class WebHandler(BaseHTTPRequestHandler):
                         return
                     json_response(self, 200, {"ok": True, "users": AUTH_STORE.list_users()})
                     return
+                if path == "/api/admin/delete-adventure":
+                    adventure_id = str(data.get("adventure_id", "")).strip()
+                    if not adventure_id:
+                        json_response(self, 400, {"error": "Seleziona un'avventura valida."})
+                        return
+                    with adventure_lock_for(adventure_id):
+                        with LOCK:
+                            if not any(adventure["id"] == adventure_id for adventure in DB.carica_sommario_avventure()):
+                                json_response(self, 404, {"error": "Avventura non trovata."})
+                                return
+                            DB.elimina_avventura(adventure_id)
+                            AUTH_STORE.remove_adventure(adventure_id)
+                    json_response(self, 200, {"ok": True})
+                    return
                 if path == "/api/admin/cleanup-adventures":
-                    adventure_ids = list(safe_adventures())
-                    for adventure_id in adventure_ids:
-                        with adventure_lock_for(adventure_id):
-                            with LOCK:
-                                DB.elimina_avventura(adventure_id)
-                                AUTH_STORE.remove_adventure(adventure_id)
+                    adventure_ids = [adventure["id"] for adventure in DB.carica_sommario_avventure()]
+                    with ExitStack() as locks:
+                        for adventure_id in sorted(adventure_ids):
+                            locks.enter_context(adventure_lock_for(adventure_id))
+                        with LOCK:
+                            DB.elimina_avventure(adventure_ids)
+                            AUTH_STORE.remove_adventures(adventure_ids)
                     json_response(self, 200, {"ok": True, "deleted": len(adventure_ids)})
                     return
                 if path == "/api/admin/api-key":
@@ -567,7 +588,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 with LOCK:
                     characters = safe_characters()
                     character_name = next((name for name in characters if name.casefold() == requested_name.casefold()), None)
-                    adventures = safe_adventures()
+                    adventures = DB.carica_metadati_avventure()
                     affected_ids = [
                         adventure_id for adventure_id, adventure in adventures.items()
                         if any(name.casefold() == requested_name.casefold() for name in (adventure.get("party") or [adventure.get("eroe", "")]))
@@ -579,7 +600,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     for adventure_id in sorted(affected_ids):
                         locks.enter_context(adventure_lock_for(adventure_id))
                     with LOCK:
-                        adventures = safe_adventures()
+                        adventures = DB.carica_metadati_avventure()
                         current_ids = [
                             adventure_id for adventure_id, adventure in adventures.items()
                             if any(name.casefold() == character_name.casefold() for name in (adventure.get("party") or [adventure.get("eroe", "")]))
@@ -598,25 +619,21 @@ class WebHandler(BaseHTTPRequestHandler):
                             updated_parties[adventure_id] = remaining
                         owned_names = {name.casefold() for name in AUTH_STORE.character_names(user["id"])}
                         owned_names.discard(character_name.casefold())
+                        member_replacements = {}
                         for adventure_id, party_names in updated_parties.items():
                             adventure = adventures[adventure_id]
                             adventure["party"] = party_names
                             adventure["eroe"] = party_names[0]
-                            DB.salva_metadati_avventura(adventure)
-                            if AUTH_STORE.is_member(user["id"], adventure_id):
-                                replacement = next((
-                                    name for name in party_names
-                                    if name.casefold() in owned_names
-                                    and name in characters
-                                    and not characters[name].get("deceduto")
-                                    and characters[name]["pf_attuali"] > 0
-                                ), None)
-                                if replacement:
-                                    AUTH_STORE.set_member_character(user["id"], adventure_id, replacement)
-                                else:
-                                    AUTH_STORE.remove_member(user["id"], adventure_id)
+                            member_replacements[adventure_id] = next((
+                                name for name in party_names
+                                if name.casefold() in owned_names
+                                and name in characters
+                                and not characters[name].get("deceduto")
+                                and characters[name]["pf_attuali"] > 0
+                            ), None)
+                        DB.salva_metadati_avventure([adventures[adventure_id] for adventure_id in updated_parties])
                         DB.elimina_personaggio(character_name)
-                        AUTH_STORE.release_character(user["id"], character_name)
+                        AUTH_STORE.update_character_adventures(user["id"], member_replacements, character_name)
                 json_response(self, 200, {"ok": True, "character": character_name})
                 return
 
@@ -1025,7 +1042,7 @@ PAGE = r"""<!doctype html>
 <header>
   <button id="sidebarToggle" type="button" aria-label="Apri il menu" aria-expanded="false">☰</button>
   <h1>D&amp;D - Scatola Rossa</h1>
-  <div class="header-actions"><span id="busyIndicator" class="busy-indicator" role="status" aria-label="Elaborazione in corso" aria-hidden="true" title="Elaborazione in corso" hidden>⌛</span><div class="status" id="status">Caricamento...</div><span id="currentUser" class="status"></span><div class="palette-control"><label for="gamePalette">Palette</label><select class="palette-select" id="gamePalette" aria-label="Scegli la palette colori"><option value="red">Scatola Rossa</option><option value="forest">Foresta</option><option value="arcane">Arcano</option><option value="midnight">Notte</option></select></div><button id="adminBtn" class="secondary" type="button" hidden>Amministrazione</button><button id="logoutBtn" class="secondary" type="button">Esci</button></div>
+  <div class="header-actions"><span id="busyIndicator" class="busy-indicator" role="status" aria-label="Elaborazione in corso" aria-hidden="true" title="Elaborazione in corso" hidden>⌛</span><div class="status" id="status">Caricamento...</div><span id="currentUser" class="status"></span><div class="palette-control"><label for="gamePalette">Palette</label><select class="palette-select" id="gamePalette" aria-label="Scegli la palette colori"><option value="red">Scatola Rossa</option><option value="forest">Foresta</option><option value="arcane">Arcano</option><option value="midnight">Notte</option></select></div><button id="cemeteryBtn" class="secondary" type="button">Cimitero degli Eroi</button><button id="adminBtn" class="secondary" type="button" hidden>Amministrazione</button><button id="logoutBtn" class="secondary" type="button">Esci</button></div>
 </header>
 <div id="sidebarBackdrop"></div>
 <div id="inventoryBackdrop"></div>
@@ -1050,7 +1067,6 @@ PAGE = r"""<!doctype html>
       <summary>Comandi disponibili</summary>
       <ul id="commandList"></ul>
     </details>
-    <button id="cemeteryBtn" class="secondary" type="button" style="width:100%">Cimitero degli Eroi</button>
   </aside>
   <section class="chat">
     <div id="messages"></div>
@@ -1139,7 +1155,9 @@ PAGE = r"""<!doctype html>
     </section>
     <section class="panel">
       <h2>Manutenzione avventure</h2>
-      <p class="muted">Elimina tutte le avventure dal database, comprese quelle iniziali o prive di proprietario.</p>
+      <p class="muted">Elimina una singola avventura oppure tutte le avventure dal database, comprese quelle iniziali o prive di proprietario.</p>
+      <div id="adminAdventures" style="display:grid;gap:8px;margin-bottom:12px"></div>
+      <p id="adminAdventureMessage" class="admin-key-status" role="status"></p>
       <button id="cleanupAdventuresBtn" class="danger" type="button">Pulisci tutte le avventure</button>
       <p id="cleanupAdventuresMessage" class="admin-key-status" role="status"></p>
     </section>
@@ -1424,9 +1442,45 @@ async function loadAdmin() {
     const key = result.api_key;
     document.getElementById('adminApiKeyStatus').textContent = key.configured
       ? `Configurata (${key.source}): ${key.masked}` : 'Nessuna chiave Gemini configurata.';
+    renderAdminAdventures(result.adventures);
   } catch(e) {
     document.getElementById('adminApiKeyMessage').textContent = e.message;
   }
+}
+
+function renderAdminAdventures(adventures) {
+  const list = document.getElementById('adminAdventures');
+  list.replaceChildren();
+  if (!adventures.length) {
+    list.textContent = 'Nessuna avventura presente.';
+    return;
+  }
+  adventures.forEach(adventure => {
+    const row = document.createElement('div');
+    row.className = 'admin-user-row';
+    const title = document.createElement('span');
+    title.textContent = `${adventure.titolo} (${adventure.data || 'data non disponibile'})`;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'danger';
+    remove.textContent = 'Elimina';
+    remove.onclick = async () => {
+      if (!confirm(`Eliminare definitivamente l'avventura "${adventure.titolo}"? Questa operazione non si può annullare.`)) return;
+      remove.disabled = true;
+      const message = document.getElementById('adminAdventureMessage');
+      try {
+        await api('/api/admin/delete-adventure', {adventure_id:adventure.id});
+        if (activeId === adventure.id) activeId = null;
+        message.textContent = `Avventura "${adventure.titolo}" eliminata.`;
+        await loadAdmin();
+      } catch(e) {
+        message.textContent = e.message;
+        remove.disabled = false;
+      }
+    };
+    row.append(title, remove);
+    list.append(row);
+  });
 }
 
 document.getElementById('adminUserForm').onsubmit = async event => {
@@ -1464,7 +1518,8 @@ document.getElementById('cleanupAdventuresBtn').onclick = async () => {
   try {
     const result = await api('/api/admin/cleanup-adventures', {});
     message.textContent = `Eliminate ${result.deleted} avventure.`;
-    await refresh();
+    if (result.deleted && state?.adventures.some(adventure => adventure.id === activeId)) activeId = null;
+    await loadAdmin();
   } catch(e) { message.textContent = e.message; }
   finally { button.disabled = false; }
 };

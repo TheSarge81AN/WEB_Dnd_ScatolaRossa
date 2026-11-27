@@ -410,16 +410,26 @@ class DnDDatabase:
         return personaggi
 
     def salva_metadati_avventura(self, adv: dict):
-        party_list = adv.get("party") or [adv.get("eroe", "Valen di Corvobianco")]
-        party_str = json.dumps(party_list, ensure_ascii=False)
-        eroe_principale = party_list[0]
-        st_dungeon = adv.get("stato_dungeon") or {
-            "torcia_turni": adv.get("torcia_turni_rimasti", 6),
-            "torcia_attiva": adv.get("torcia_attiva", True)
-        }
-        st_dungeon_str = json.dumps(st_dungeon, ensure_ascii=False)
+        self.salva_metadati_avventure([adv])
+
+    def salva_metadati_avventure(self, avventure: list[dict]):
+        rows = []
+        for adv in avventure:
+            party_list = adv.get("party") or [adv.get("eroe", "Valen di Corvobianco")]
+            st_dungeon = adv.get("stato_dungeon") or {
+                "torcia_turni": adv.get("torcia_turni_rimasti", 6),
+                "torcia_attiva": adv.get("torcia_attiva", True)
+            }
+            rows.append((
+                adv["id"], adv["titolo"], party_list[0], json.dumps(party_list, ensure_ascii=False),
+                adv.get("data", datetime.now().strftime("%d/%m/%Y %H:%M")),
+                adv.get("modulo_pdf", ""), adv.get("modulo_testo", ""),
+                json.dumps(st_dungeon, ensure_ascii=False)
+            ))
+        if not rows:
+            return
         with self.conn:
-            self.conn.execute("""
+            self.conn.executemany("""
                 INSERT INTO avventure (id, titolo, eroe_nome, party_json, data_aggiornamento, modulo_pdf, modulo_testo, stato_dungeon_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
@@ -430,12 +440,7 @@ class DnDDatabase:
                     modulo_pdf = excluded.modulo_pdf,
                     modulo_testo = excluded.modulo_testo,
                     stato_dungeon_json = excluded.stato_dungeon_json
-            """, (
-                adv["id"], adv["titolo"], eroe_principale, party_str,
-                adv.get("data", datetime.now().strftime("%d/%m/%Y %H:%M")),
-                adv.get("modulo_pdf", ""), adv.get("modulo_testo", ""),
-                st_dungeon_str
-            ))
+            """, rows)
 
     def aggiungi_messaggio(self, avventura_id: str, ruolo: str, testo: str):
         if not testo or not testo.strip():
@@ -486,8 +491,50 @@ class DnDDatabase:
         return "\n".join(righe) + ("\n" if righe else "")
 
     def elimina_avventura(self, avventura_id: str):
+        self.elimina_avventure([avventura_id])
+
+    def elimina_avventure(self, avventura_ids: list[str]):
+        if not avventura_ids:
+            return
         with self.conn:
-            self.conn.execute("DELETE FROM avventure WHERE id = ?", (avventura_id,))
+            self.conn.executemany(
+                "DELETE FROM avventure WHERE id = ?",
+                [(avventura_id,) for avventura_id in avventura_ids]
+            )
+
+    def carica_sommario_avventure(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, titolo, data_aggiornamento FROM avventure ORDER BY id ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def carica_metadati_avventure(self) -> dict:
+        rows = self.conn.execute("SELECT * FROM avventure ORDER BY id ASC").fetchall()
+        avventure = {}
+        for row in rows:
+            try:
+                party = json.loads(row["party_json"] or "[]")
+            except Exception:
+                party = []
+            if not party:
+                party = [row["eroe_nome"]]
+            try:
+                stato_dungeon = json.loads(row["stato_dungeon_json"] or "{}")
+            except Exception:
+                stato_dungeon = {}
+            avventure[row["id"]] = {
+                "id": row["id"],
+                "titolo": row["titolo"],
+                "eroe": party[0],
+                "party": party,
+                "data": row["data_aggiornamento"],
+                "modulo_pdf": row["modulo_pdf"] or "",
+                "modulo_testo": row["modulo_testo"] or "",
+                "stato_dungeon": stato_dungeon,
+                "torcia_turni_rimasti": stato_dungeon.get("torcia_turni", 6),
+                "torcia_attiva": stato_dungeon.get("torcia_attiva", True)
+            }
+        return avventure
 
     def carica_tutte_avventure(self) -> dict:
         avventure = {}
