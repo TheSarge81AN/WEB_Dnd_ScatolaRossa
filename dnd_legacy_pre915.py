@@ -4,6 +4,7 @@ import re
 import json
 import time
 import base64
+import importlib
 import random
 import select
 import subprocess
@@ -855,7 +856,7 @@ def estrai_testo_pdf(percorso_pdf):
     except Exception:
         pass
     try:
-        import pypdf
+        pypdf = importlib.import_module("pypdf")
         reader = pypdf.PdfReader(percorso_pdf)
         pagine = [p.extract_text() or "" for p in reader.pages]
         testo = "\n".join(pagine).strip()
@@ -1392,6 +1393,7 @@ def crea_nuova_avventura(avventure, personaggi):
 
     modulo_pdf = ""
     modulo_testo = ""
+    titolo, prompt = SCENARI_AVVENTURA["1"]
     scelta_scen = input(f"\n{VERDE}Seleziona scenario > {RESET}").strip().lower()
     if scelta_scen == "m":
         moduli = elenca_moduli_pdf()

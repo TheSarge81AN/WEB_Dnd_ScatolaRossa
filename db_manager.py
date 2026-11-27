@@ -94,7 +94,10 @@ class DnDDatabase:
         """
         with self.conn:
             cur = self.conn.execute(sql, dati)
-            return cur.lastrowid
+            personaggio_id = cur.lastrowid
+            if personaggio_id is None:
+                raise RuntimeError("Inserimento del personaggio senza ID restituito dal database.")
+            return personaggio_id
 
     def get_personaggio(self, nome: str) -> Optional[dict]:
         cur = self.conn.execute("SELECT * FROM personaggi WHERE nome = ?", (nome,))

@@ -1,19 +1,20 @@
+import importlib
 import re
 import sqlite3
 import threading
-from urllib.parse import urlparse
+from typing import Any, Sequence, Union
 
 
 class IntegrityError(Exception):
 	pass
 
 
-class HybridRow(dict):
-	def __init__(self, names, values):
+class HybridRow(dict[str, Any]):
+	def __init__(self, names: Sequence[str], values: Sequence[Any]):
 		super().__init__(zip(names, values))
 		self._values = values
 
-	def __getitem__(self, key):
+	def __getitem__(self, key: Union[str, int]) -> Any:
 		if isinstance(key, int):
 			return self._values[key]
 		return super().__getitem__(key)
@@ -28,14 +29,18 @@ class DatabaseCursor:
 	def _row(self, row):
 		if row is None or not self.remote:
 			return row
-		names = [column.name for column in self.cursor.description]
+		names = [column[0] for column in self.cursor.description]
 		return HybridRow(names, row)
 
-	def fetchone(self):
+	def fetchone(self) -> Any:
 		return self._row(self.cursor.fetchone())
 
-	def fetchall(self):
-		return [self._row(row) for row in self.cursor.fetchall()]
+	def fetchall(self) -> list[Any]:
+		rows = self.cursor.fetchall()
+		if not self.remote or not rows:
+			return rows
+		names = [column[0] for column in self.cursor.description]
+		return [HybridRow(names, row) for row in rows]
 
 	def __getattr__(self, name):
 		return getattr(self.cursor, name)
@@ -46,10 +51,10 @@ class DatabaseConnection:
 		self.location = location
 		self.remote = is_remote(location)
 		self._lock = threading.RLock()
-		self._raw = None
+		self._raw: Any = None
 		if self.remote:
 			try:
-				import psycopg
+				psycopg = importlib.import_module("psycopg")
 			except ImportError as exc:
 				raise RuntimeError("Per DB_LOCATION remoto installa la dipendenza psycopg[binary].") from exc
 			self._raw = psycopg.connect(location, connect_timeout=timeout)
@@ -167,8 +172,9 @@ class DatabaseConnection:
 def is_remote(location):
 	if not isinstance(location, str):
 		return False
-	scheme = urlparse(location).scheme.lower()
-	return scheme in {"postgres", "postgresql"}
+	normalized = location.strip(" \t\r\n\x00").translate({ord(char): None for char in "\t\r\n"})
+	scheme, separator, _ = normalized.partition(":")
+	return bool(separator) and scheme.casefold() in {"postgres", "postgresql"}
 
 
 def connect(location, timeout=10, check_same_thread=True):

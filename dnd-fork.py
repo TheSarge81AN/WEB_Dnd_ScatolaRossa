@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import json
+import importlib
 import time
 import socket
 import base64
@@ -17,6 +18,7 @@ import wave
 import zlib
 import hashlib
 from datetime import datetime
+from typing import Optional
 
 from google import genai
 from google.genai import errors, types
@@ -1220,7 +1222,7 @@ def estrai_testo_pdf(percorso_pdf):
     except Exception:
         pass
     try:
-        import pypdf
+        pypdf = importlib.import_module("pypdf")
         reader = pypdf.PdfReader(percorso_pdf)
         pagine = [p.extract_text() or "" for p in reader.pages]
         testo = "\n".join(pagine).strip()
@@ -1255,7 +1257,8 @@ def normalizza_personaggio_json(chiave, item):
         item = {}
     base = CLASSI_BASE["1"]
     nome = item.get("nome") or item.get("name") or str(chiave)
-    car = item.get("caratteristiche") if isinstance(item.get("caratteristiche"), dict) else {}
+    caratteristiche = item.get("caratteristiche")
+    car = caratteristiche if isinstance(caratteristiche, dict) else {}
     item["nome"] = nome
     item.setdefault("classe", base["classe"])
     item.setdefault("livello", 1)
@@ -1984,6 +1987,8 @@ def crea_nuova_avventura(db: DnDDatabase, avventure: dict, personaggi: dict):
     print(f"  {CIANO}[P]{RESET} Scenario personalizzato")
     print(f"  {DIM}[0] Torna al Menu Principale{RESET}")
 
+    titolo = SCENARI_AVVENTURA["1"][0]
+    prompt = f"Gruppo di avventurieri: {', '.join(party_nomi)}. {SCENARI_AVVENTURA['1'][1]}"
     modulo_pdf = ""
     modulo_testo = ""
     scelta_scen = input(f"\n{VERDE}Seleziona scenario > {RESET}").strip().lower()
@@ -2527,7 +2532,7 @@ class PDFCanvas:
             cmd.append("S")
         self.stream.append("\n".join(cmd))
 
-    def text(self, x, y, string, font="F1", size=10, color=(0, 0, 0)):
+    def text(self, x, y, string, font="F1", size: float = 10.0, color=(0, 0, 0)):
         clean = sanitize_pdf_text(str(string))
         safe_str = clean.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
         cmd = [
@@ -2758,7 +2763,7 @@ def estrai_dossier_stanze(righe_legenda):
     return stanze
 
 
-def esporta_mappa_pdf_a4(avventura: dict, eroi_party: list, testo_mappa: str = None, api_key: str = None) -> str:
+def esporta_mappa_pdf_a4(avventura: dict, eroi_party: list, testo_mappa: Optional[str] = None, api_key: Optional[str] = None) -> str:
     dir_mappe = MAPPE_DIR
     os.makedirs(dir_mappe, exist_ok=True)
     titolo_pulito = re.sub(r"[^\w\-_]", "_", avventura.get("titolo", "avventura")).strip("_")
@@ -2766,11 +2771,10 @@ def esporta_mappa_pdf_a4(avventura: dict, eroi_party: list, testo_mappa: str = N
     nome_file = f"mappa_{titolo_pulito}_{timestamp}_A4.pdf"
     percorso_completo = os.path.join(dir_mappe, nome_file)
 
+    if not testo_mappa and api_key:
+        testo_mappa = genera_mappa_ascii(avventura, api_key, eroi_party)
     if not testo_mappa:
-        if api_key:
-            testo_mappa = genera_mappa_ascii(avventura, api_key, eroi_party)
-        else:
-            testo_mappa = avventura.get("ultima_mappa_ascii", "+---+\n| 1 |\n+---+")
+        testo_mappa = str(avventura.get("ultima_mappa_ascii") or "+---+\n| 1 |\n+---+")
 
     avventura["ultima_mappa_ascii"] = testo_mappa
 
@@ -3517,7 +3521,7 @@ def rileva_intento_torcia(testo: str):
     return None
 
 
-def rileva_ambiente_e_luce(testo_dm: str, azione: str = "", st_attuale: dict = None):
+def rileva_ambiente_e_luce(testo_dm: str, azione: str = "", st_attuale: Optional[dict] = None):
     st = st_attuale or {}
     blocco_manuale = st.get("ambiente_manuale", False)
     if blocco_manuale:
@@ -4386,6 +4390,7 @@ def esegui_sessione(db: DnDDatabase, avventura: dict, personaggi: dict, api_key:
 
     pulisci_schermo(avventura, eroi_party)
 
+    prompt_init = ""
     if len(avventura["storia"]) <= 1:
         if not avventura["storia"]:
             prompt_init = f"Gruppo di avventurieri: {', '.join(party_nomi)}. {SCENARI_AVVENTURA['1'][1]}"
@@ -4402,7 +4407,7 @@ def esegui_sessione(db: DnDDatabase, avventura: dict, personaggi: dict, api_key:
             db.aggiungi_messaggio(avventura["id"], "model", testo_dm)
             aggiorna_party_da_riquadro(eroi_party, testo_dm)
             st_d = avventura.setdefault("stato_dungeon", {})
-            luce_amb, amb_nome, manuale = rileva_ambiente_e_luce(testo_dm, prompt_init if 'prompt_init' in locals() else '', st_d)
+            luce_amb, amb_nome, manuale = rileva_ambiente_e_luce(testo_dm, prompt_init, st_d)
             st_d["luce_ambientale"] = luce_amb
             st_d["ambiente_nome"] = amb_nome
             st_d["ambiente_manuale"] = manuale
@@ -4876,7 +4881,10 @@ def esegui_sessione(db: DnDDatabase, avventura: dict, personaggi: dict, api_key:
             print(f"{DIM}{testo_mostrato}{RESET}\n")
             try:
                 import termios
-                termios.tcflush(sys.stdin, termios.TCIFLUSH)
+                flush_input = getattr(termios, "tcflush", None)
+                input_queue = getattr(termios, "TCIFLUSH", None)
+                if flush_input is not None and input_queue is not None:
+                    flush_input(sys.stdin, input_queue)
             except Exception:
                 pass
             formatta_risposta(testo_dm, animato=True)

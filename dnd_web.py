@@ -1,5 +1,4 @@
 import getpass
-import html
 import io
 import json
 import os
@@ -15,7 +14,7 @@ from contextlib import ExitStack, redirect_stdout
 from datetime import datetime
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 import db_backend
 import dnd_fork as game
@@ -296,11 +295,10 @@ def perform_action(adventure_id, action, user):
     with adventure_lock_for(adventure_id):
         with LOCK:
             adventure = safe_adventures().get(adventure_id)
+            if not adventure:
+                return 404, {"error": "Avventura non trovata."}
             characters = safe_characters()
-            if adventure:
-                party = get_party(adventure, characters)
-        if not adventure:
-            return 404, {"error": "Avventura non trovata."}
+            party = get_party(adventure, characters)
         if not AUTH_STORE.is_member(user["id"], adventure_id):
             return 403, {"error": "Unisciti all'avventura prima di inviare azioni."}
         party_names = adventure.get("party") or [adventure.get("eroe", "Valen di Corvobianco")]
@@ -314,7 +312,9 @@ def perform_action(adventure_id, action, user):
             AUTH_STORE.set_member_character(user["id"], adventure_id, character_name)
 
         selected_character = characters.get(character_name)
-        if not selected_character or selected_character.get("deceduto") or selected_character["pf_attuali"] <= 0:
+        if selected_character is None:
+            return 403, {"error": "Questo personaggio è nel cimitero e non può più giocare."}
+        if selected_character.get("deceduto") or selected_character["pf_attuali"] <= 0:
             return 403, {"error": "Questo personaggio è nel cimitero e non può più giocare."}
 
         with LOCK:
@@ -385,30 +385,36 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def require_auth(self):
         try:
-            self.current_user = AUTH_STORE.get_user(self.session_token())
+            user = AUTH_STORE.get_user(self.session_token())
         except (OSError, ValueError) as exc:
             json_response(self, 500, {"error": str(exc)})
-            return False
-        if self.current_user:
-            return True
+            return None
+        if user:
+            return user
         json_response(self, 401, {"error": "Accedi per continuare."})
-        return False
+        return None
 
     def require_admin(self):
-        if not hasattr(self, "current_user") and not self.require_auth():
+        user = self.require_auth()
+        if user is None:
             return False
-        if self.current_user.get("is_admin"):
+        if user.get("is_admin"):
             return True
         json_response(self, 403, {"error": "Accesso riservato all'amministratore."})
         return False
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        path = urlsplit(self.path).path
         if path == "/health":
             json_response(self, 200, {"status": "ok"})
             return
         static_files = {
             "/app.webmanifest": ("app.webmanifest", "application/manifest+json"),
+            "/service-worker.js": ("service-worker.js", "application/javascript; charset=utf-8"),
+            "/imgs/app-icon-192.png": (os.path.join("imgs", "app-icon-192.png"), "image/png"),
+            "/imgs/app-icon-512.png": (os.path.join("imgs", "app-icon-512.png"), "image/png"),
+            "/imgs/apple-touch-icon.png": (os.path.join("imgs", "apple-touch-icon.png"), "image/png"),
+            "/imgs/favicon-32.png": (os.path.join("imgs", "favicon-32.png"), "image/png"),
             "/imgs/app-icon.svg": (os.path.join("imgs", "app-icon.svg"), "image/svg+xml"),
             "/imgs/DnD.webp": (os.path.join("imgs", "DnD.webp"), "image/webp"),
         }
@@ -423,7 +429,8 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "public, max-age=3600")
+            cache_control = "no-cache" if path in ("/service-worker.js", "/app.webmanifest") else "public, max-age=3600"
+            self.send_header("Cache-Control", cache_control)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(payload)
@@ -452,19 +459,20 @@ class WebHandler(BaseHTTPRequestHandler):
             except (OSError, ValueError) as exc:
                 json_response(self, 500, {"error": str(exc)})
             return
-        if not self.require_auth():
+        user = self.require_auth()
+        if user is None:
             return
         if path == "/api/state":
             with LOCK:
                 adventures = safe_adventures()
                 characters = safe_characters()
-            owned_names = AUTH_STORE.character_names(self.current_user["id"])
+            owned_names = AUTH_STORE.character_names(user["id"])
             key = api_key_active()
             adventure_data = []
             for adventure in adventures.values():
                 view = adventure_view(adventure)
-                view["joined"] = AUTH_STORE.is_member(self.current_user["id"], adventure["id"])
-                view["can_delete"] = AUTH_STORE.is_adventure_owner(self.current_user["id"], adventure["id"])
+                view["joined"] = AUTH_STORE.is_member(user["id"], adventure["id"])
+                view["can_delete"] = AUTH_STORE.is_adventure_owner(user["id"], adventure["id"])
                 view["members"] = AUTH_STORE.member_names(adventure["id"])
                 adventure_data.append(view)
             cemetery = []
@@ -480,7 +488,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     view["avventura_morte"] = party_adventures[-1] if party_adventures else "Avventura non registrata"
                 cemetery.append(view)
             json_response(self, 200, {
-                "user": self.current_user,
+                "user": user,
                 "adventures": adventure_data,
                 "characters": [character_view(v) for v in characters.values()],
                 "owned_characters": [character_view(characters[name]) for name in owned_names if name in characters],
@@ -499,7 +507,7 @@ class WebHandler(BaseHTTPRequestHandler):
         json_response(self, 404, {"error": "Endpoint non trovato"})
 
     def do_POST(self):
-        path = urlparse(self.path).path
+        path = urlsplit(self.path).path
         try:
             data = body_json(self)
 
@@ -563,9 +571,52 @@ class WebHandler(BaseHTTPRequestHandler):
                 json_response(self, 404, {"error": "Endpoint amministrazione non trovato."})
                 return
 
-            if not self.require_auth():
+            user = self.require_auth()
+            if user is None:
                 return
-            user = self.current_user
+
+            if path == "/api/diary":
+                adventure_id = str(data.get("adventure_id", "")).strip()
+                operation = str(data.get("operation", ""))
+                if not adventure_id:
+                    json_response(self, 400, {"error": "Avventura non valida."})
+                    return
+                if not AUTH_STORE.is_member(user["id"], adventure_id):
+                    json_response(self, 403, {"error": "Unisciti all'avventura per gestire il diario."})
+                    return
+                with adventure_lock_for(adventure_id):
+                    with LOCK:
+                        if operation == "add":
+                            note = str(data.get("text", "")).strip()
+                            if not note:
+                                json_response(self, 400, {"error": "Scrivi il testo dell'annotazione."})
+                                return
+                            if len(note) > 2000:
+                                json_response(self, 400, {"error": "L'annotazione non può superare 2000 caratteri."})
+                                return
+                            DB.aggiungi_nota(avventura_id=adventure_id, testo_nota=note)
+                        elif operation == "delete":
+                            raw_note_id = data.get("note_id")
+                            if raw_note_id is None:
+                                json_response(self, 400, {"error": "Annotazione non valida."})
+                                return
+                            try:
+                                note_id = int(raw_note_id)
+                            except (TypeError, ValueError):
+                                json_response(self, 400, {"error": "Annotazione non valida."})
+                                return
+                            if note_id <= 0:
+                                json_response(self, 400, {"error": "Annotazione non valida."})
+                                return
+                            if not DB.elimina_nota(adventure_id, note_id):
+                                json_response(self, 404, {"error": "Annotazione non trovata."})
+                                return
+                        elif operation != "list":
+                            json_response(self, 400, {"error": "Operazione diario non valida."})
+                            return
+                        notes = DB.carica_note_diario(adventure_id)
+                json_response(self, 200, {"ok": True, "notes": notes})
+                return
 
             if path == "/api/character/delete":
                 requested_name = str(data.get("character", "")).strip()
@@ -830,7 +881,7 @@ class WebHandler(BaseHTTPRequestHandler):
             json_response(self, 500, {"error": str(exc)})
 
     def log_message(self, format, *args):
-        return
+        _ = format, args
 
 
 PAGE = r"""<!doctype html>
@@ -839,7 +890,12 @@ PAGE = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#9c1c20">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="D&amp;D Scatola Rossa">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="icon" type="image/png" sizes="32x32" href="/imgs/favicon-32.png">
   <link rel="icon" type="image/svg+xml" href="/imgs/app-icon.svg">
+  <link rel="apple-touch-icon" sizes="180x180" href="/imgs/apple-touch-icon.png">
   <link rel="manifest" href="/app.webmanifest">
   <title>D&D - Scatola Rossa</title>
   <style>
@@ -983,6 +1039,14 @@ PAGE = r"""<!doctype html>
     dialog { color:var(--ink); background:var(--paper); border:1px solid var(--panel-border); border-radius:16px; box-shadow:0 24px 64px #0005; }
     dialog::backdrop { background:#11182099; backdrop-filter:blur(3px); }
     dialog h2 { color:var(--red); }
+    .diary-dialog { width:min(620px,calc(100vw - 24px)); max-height:min(85vh,760px); max-height:min(85dvh,760px); padding:20px; overflow:auto; }
+    .diary-dialog h2 { margin:0; }
+    .diary-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .diary-note-list { list-style:none; margin:12px 0 0; padding:0; }
+    .diary-note { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:12px 0; border-top:1px solid var(--panel-heading-border); }
+    .diary-note-content { flex:1; min-width:0; overflow-wrap:anywhere; white-space:pre-wrap; }
+    .diary-note-time { display:block; margin-bottom:5px; color:var(--muted); font-size:12px; }
+    .diary-note-delete { flex:0 0 auto; }
     .chat { min-width:0; }
     @media (max-width:900px) {
       main { grid-template-columns:240px minmax(0, 1fr); }
@@ -1048,6 +1112,7 @@ PAGE = r"""<!doctype html>
     <div class="panel">
       <h2>Partita</h2>
       <div id="partyAdventureTitle" class="party-title">Nessuna avventura selezionata</div>
+      <button id="diaryBtn" class="secondary" type="button" style="width:100%;margin:0 0 8px" disabled>Gestisci diario</button>
       <div id="party"></div>
     </div>
     <div class="panel">
@@ -1131,6 +1196,19 @@ PAGE = r"""<!doctype html>
 </dialog>
 </div>
 
+<dialog id="diaryDialog" class="diary-dialog" aria-labelledby="diaryTitle">
+  <div class="diary-heading">
+    <h2 id="diaryTitle">Diario dell'avventura</h2>
+    <button id="diaryClose" class="secondary" type="button" aria-label="Chiudi diario">×</button>
+  </div>
+  <p id="diaryAdventureTitle" class="muted"></p>
+  <label for="diaryNoteInput">Nuova annotazione</label>
+  <textarea id="diaryNoteInput" rows="3" maxlength="2000" placeholder="Scrivi un appunto per il gruppo..."></textarea>
+  <button id="diarySave" type="button" style="margin-top:8px">Salva annotazione</button>
+  <p id="diaryMessage" class="admin-key-status" role="status" aria-live="polite"></p>
+  <ul id="diaryNotes" class="diary-note-list"></ul>
+</dialog>
+
 <section id="adminView" hidden>
   <header>
     <h1>Amministrazione</h1>
@@ -1180,9 +1258,18 @@ PAGE = r"""<!doctype html>
 <script>
 let state = null;
 let activeId = null;
+let activeDiaryAdventureId = null;
 let processingOperations = 0;
 let databaseActivityOperations = 0;
 const PALETTE_NAMES = new Set(['red', 'forest', 'arcane', 'midnight']);
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/service-worker.js').catch(error => {
+      console.warn('Registrazione service worker non riuscita.', error);
+    });
+  });
+}
 
 function applyPalette(palette, persist = true) {
   const selected = PALETTE_NAMES.has(palette) ? palette : 'red';
@@ -1313,6 +1400,10 @@ document.getElementById('sidebarToggle').onclick = () => {
 document.getElementById('sidebarBackdrop').onclick = closeSidebar;
 document.getElementById('inventoryBackdrop').onclick = closeInventory;
 document.getElementById('inventoryClose').onclick = closeInventory;
+document.getElementById('diaryBtn').onclick = openDiary;
+document.getElementById('diaryClose').onclick = () => document.getElementById('diaryDialog').close();
+document.getElementById('diaryDialog').addEventListener('close', () => { activeDiaryAdventureId = null; });
+document.getElementById('diarySave').onclick = saveDiaryNote;
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
     closeSidebar();
@@ -1791,6 +1882,7 @@ function renderActive(allowAutoScroll = true) {
   const messages = document.getElementById('messages');
   const party = document.getElementById('party');
   const title = document.getElementById('partyAdventureTitle');
+  document.getElementById('diaryBtn').disabled = !adv;
   if (!adv) {
     title.textContent = 'Nessuna avventura selezionata';
     const placeholder = '<div class="message">Seleziona una sessione a cui partecipi o unisciti a una sessione disponibile.</div>';
@@ -1889,6 +1981,108 @@ async function showInventory(name) {
     if (activeInventoryName === name) document.getElementById('inventoryContent').textContent = result.output || 'Inventario vuoto.';
   } catch(e) {
     if (activeInventoryName === name) document.getElementById('inventoryContent').textContent = e.message;
+  }
+}
+
+async function openDiary() {
+  const adventure = state?.adventures.find(item => item.id === activeId && item.joined);
+  if (!adventure) return;
+  closeSidebar();
+  closeInventory();
+  activeDiaryAdventureId = adventure.id;
+  document.getElementById('diaryTitle').textContent = `Diario — ${adventure.titolo}`;
+  document.getElementById('diaryAdventureTitle').textContent = 'Annotazioni condivise con il gruppo.';
+  document.getElementById('diaryNoteInput').value = '';
+  document.getElementById('diaryMessage').textContent = '';
+  document.getElementById('diaryDialog').showModal();
+  await loadDiaryNotes(adventure.id);
+}
+
+async function loadDiaryNotes(adventureId) {
+  const list = document.getElementById('diaryNotes');
+  list.textContent = 'Caricamento annotazioni...';
+  try {
+    const result = await api('/api/diary', {operation:'list', adventure_id:adventureId});
+    if (activeDiaryAdventureId !== adventureId) return;
+    renderDiaryNotes(result.notes, adventureId);
+  } catch(e) {
+    if (activeDiaryAdventureId === adventureId) {
+      list.replaceChildren();
+      document.getElementById('diaryMessage').textContent = e.message;
+    }
+  }
+}
+
+function renderDiaryNotes(notes, adventureId) {
+  const list = document.getElementById('diaryNotes');
+  list.replaceChildren();
+  if (!notes.length) {
+    const empty = document.createElement('li');
+    empty.className = 'muted';
+    empty.textContent = 'Nessuna annotazione salvata.';
+    list.appendChild(empty);
+    return;
+  }
+  notes.forEach(note => {
+    const item = document.createElement('li');
+    item.className = 'diary-note';
+    const content = document.createElement('div');
+    content.className = 'diary-note-content';
+    const timestamp = document.createElement('time');
+    timestamp.className = 'diary-note-time';
+    timestamp.textContent = note.timestamp;
+    const text = document.createElement('div');
+    text.textContent = note.testo;
+    content.append(timestamp, text);
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'danger diary-note-delete';
+    remove.textContent = 'Elimina';
+    remove.setAttribute('aria-label', 'Elimina annotazione');
+    remove.onclick = async () => {
+      if (!confirm('Eliminare questa annotazione dal diario?')) return;
+      remove.disabled = true;
+      try {
+        const result = await api('/api/diary', {
+          operation:'delete',
+          adventure_id:adventureId,
+          note_id:note.id
+        });
+        if (activeDiaryAdventureId !== adventureId) return;
+        renderDiaryNotes(result.notes, adventureId);
+        document.getElementById('diaryMessage').textContent = 'Annotazione eliminata.';
+      } catch(e) {
+        document.getElementById('diaryMessage').textContent = e.message;
+        remove.disabled = false;
+      }
+    };
+    item.append(content, remove);
+    list.appendChild(item);
+  });
+}
+
+async function saveDiaryNote() {
+  const adventureId = activeDiaryAdventureId;
+  const input = document.getElementById('diaryNoteInput');
+  const button = document.getElementById('diarySave');
+  const message = document.getElementById('diaryMessage');
+  const text = input.value.trim();
+  if (!adventureId || !text) {
+    message.textContent = 'Scrivi il testo dell’annotazione.';
+    return;
+  }
+  button.disabled = true;
+  message.textContent = '';
+  try {
+    const result = await api('/api/diary', {operation:'add', adventure_id:adventureId, text});
+    if (activeDiaryAdventureId !== adventureId) return;
+    input.value = '';
+    renderDiaryNotes(result.notes, adventureId);
+    message.textContent = 'Annotazione salvata.';
+  } catch(e) {
+    message.textContent = e.message;
+  } finally {
+    button.disabled = false;
   }
 }
 

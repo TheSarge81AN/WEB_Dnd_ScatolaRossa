@@ -5,6 +5,7 @@ import json
 import time
 import socket
 import base64
+import importlib
 import random
 import select
 import subprocess
@@ -16,6 +17,7 @@ import wave
 import zlib
 import hashlib
 from datetime import datetime
+from typing import Optional
 
 import db_backend
 from google import genai
@@ -46,6 +48,16 @@ DEFAULT_LAN_PORT = 5555
 CHIAVE_API_PREDEFINITA = ""
 KEY_FILE = ".gemini_api_key"
 API_KEY_ATTIVA = ""
+
+
+def is_posix():
+    return os.name == "posix"
+
+
+def clear_console():
+    command = ["clear"] if is_posix() else ["cmd", "/c", "cls"]
+    subprocess.run(command, check=False)
+
 
 VERDE = "\033[92m"
 GIALLO = "\033[93m"
@@ -114,7 +126,7 @@ def richiedi_api_key_interattiva(forza_richiesta=False) -> str:
         if chiave:
             return chiave
 
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     print(LOGO_INTRO)
     print(f"{CIANO}{GRASSETTO}================================================================================================{RESET}")
     print(f"{GIALLO}{GRASSETTO}🔑 AUTENTICAZIONE GOOGLE GEMINI AI - D&D BECMI FORK{RESET}")
@@ -476,6 +488,24 @@ class DnDDatabase:
                 "INSERT INTO diario_note (avventura_id, testo) VALUES (?, ?)",
                 (avventura_id, testo_nota.strip())
             )
+
+    def carica_note_diario(self, avventura_id: str) -> list:
+        cur = self.conn.execute(
+            "SELECT id, testo, timestamp FROM diario_note WHERE avventura_id = ? ORDER BY id ASC",
+            (avventura_id,)
+        )
+        return [
+            {"id": row["id"], "testo": row["testo"], "timestamp": str(row["timestamp"])}
+            for row in cur.fetchall()
+        ]
+
+    def elimina_nota(self, avventura_id: str, nota_id: int) -> bool:
+        with self.conn:
+            cur = self.conn.execute(
+                "DELETE FROM diario_note WHERE avventura_id = ? AND id = ?",
+                (avventura_id, nota_id)
+            )
+        return cur.rowcount > 0
 
     def get_note_formattate(self, avventura_id: str) -> str:
         cur = self.conn.execute(
@@ -852,7 +882,7 @@ def verifica_passaggio_livello(eroe):
         sincronizza_statistiche_becmi(eroe)
         suona("levelup")
         print(f"\n{VERDE}{GRASSETTO}*** PASSAGGIO DI LIVELLO BECMI! ***{RESET}")
-        for liv, guad, dett in avanzamenti:
+        for liv, _, dett in avanzamenti:
             print(f"{GIALLO}  -> {eroe['nome']} sale al Livello {liv} ({fascia_regole_becmi(liv)})! [{dett}]{RESET}")
         print(f"{CIANO}  -> Nuovi PF Max: {eroe['pf_max']} | {eroe['attacco']}{RESET}\n")
     return avanzamenti
@@ -1236,7 +1266,7 @@ def estrai_testo_pdf(percorso_pdf):
     except Exception:
         pass
     try:
-        import pypdf
+        pypdf = importlib.import_module("pypdf")
         reader = pypdf.PdfReader(percorso_pdf)
         pagine = [p.extract_text() or "" for p in reader.pages]
         testo = "\n".join(pagine).strip()
@@ -1271,7 +1301,8 @@ def normalizza_personaggio_json(chiave, item):
         item = {}
     base = CLASSI_BASE["1"]
     nome = item.get("nome") or item.get("name") or str(chiave)
-    car = item.get("caratteristiche") if isinstance(item.get("caratteristiche"), dict) else {}
+    caratteristiche = item.get("caratteristiche")
+    car = caratteristiche if isinstance(caratteristiche, dict) else {}
     item["nome"] = nome
     item.setdefault("classe", base["classe"])
     item.setdefault("razza", "Umano")
@@ -1655,9 +1686,8 @@ def scegli_membro_party(eroi_party: list, azione_desc: str):
 
 
 def pulisci_schermo(avventura, eroi_party: list, ruolo_rete=""):
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     turno = len(avventura["storia"]) // 2
-    stato_dadi = f"{VERDE}ON{RESET}" if AUTODADI_ATTIVI else f"{DIM}OFF{RESET}"
     nomi_str = ", ".join(f"{e['nome']} (Liv.{e['livello']})" for e in eroi_party)
     st_dungeon = avventura.get("stato_dungeon") or {}
     luce_amb = st_dungeon.get("luce_ambientale", False)
@@ -1712,6 +1742,7 @@ class IndicatoreAttesaDM:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        _ = (exc_type, exc_val, exc_tb)
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=0.3)
@@ -1842,7 +1873,7 @@ def chiama_gemini(storia, api_key, system_prompt, pdf_path=None, desc_attesa="st
 
 
 def tasto_premuto():
-    if os.name == "posix":
+    if is_posix():
         dr, _, _ = select.select([sys.stdin], [], [], 0)
         if dr:
             sys.stdin.readline()
@@ -1903,7 +1934,7 @@ def formatta_risposta(testo, animato=False):
 
 
 def crea_personaggio(db: DnDDatabase, personaggi: dict):
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     print(f"{CIANO}{GRASSETTO}=== CREAZIONE NUOVO PERSONAGGIO (SCALA COMPLETA BECMI) ==={RESET}\n")
     for k, v in CLASSI_BASE.items():
         print(f"  {VERDE}{GRASSETTO}[{k}]{RESET} {v['classe']:<10} (DV 1d{v['dado_vita']}, Max Liv.{v['max_liv']:<2}, CA base {v['ca_base']}, For {v['forza']}, Des {v['destrezza']})")
@@ -1974,7 +2005,7 @@ def crea_personaggio(db: DnDDatabase, personaggi: dict):
 
 
 def crea_nuova_avventura(db: DnDDatabase, avventure: dict, personaggi: dict):
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     print(f"{CIANO}{GRASSETTO}=== NUOVA AVVENTURA (SINGOLO O PARTY MULTI-GIOCATORE) ==={RESET}")
     print(f"{DIM}Digita 0 in qualsiasi passaggio per tornare al Menu Principale.{RESET}\n")
 
@@ -2017,6 +2048,8 @@ def crea_nuova_avventura(db: DnDDatabase, avventure: dict, personaggi: dict):
     print(f"  {CIANO}[P]{RESET} Scenario personalizzato")
     print(f"  {DIM}[0] Torna al Menu Principale{RESET}")
 
+    titolo = SCENARI_AVVENTURA["1"][0]
+    prompt = f"Gruppo di avventurieri: {', '.join(party_nomi)}. {SCENARI_AVVENTURA['1'][1]}"
     modulo_pdf = ""
     modulo_testo = ""
     scelta_scen = input(f"\n{VERDE}Seleziona scenario > {RESET}").strip().lower()
@@ -2119,7 +2152,7 @@ def crea_nuova_avventura(db: DnDDatabase, avventure: dict, personaggi: dict):
 def menu_principale(db: DnDDatabase, avventure: dict, personaggi: dict):
     global MODELLO, MODALITA_GIOCO, AUTODADI_ATTIVI, API_KEY_ATTIVA
     while True:
-        os.system("clear" if os.name == "posix" else "cls")
+        clear_console()
         print(LOGO_INTRO)
         stats = db.statistiche_db()
         ip_lan = ottieni_ip_locale()
@@ -2278,13 +2311,13 @@ def menu_principale(db: DnDDatabase, avventure: dict, personaggi: dict):
 
 
 def apri_emporio(db: DnDDatabase, eroi_party: list, avventura: dict):
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     print(f"{GIALLO}{GRASSETTO}=== EMPORIO DELLE TERRE DI CONFINE ==={RESET}")
     eroe = scegli_membro_party(eroi_party, "fare acquisti")
     if not eroe:
         return
 
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     print(f"{GIALLO}{GRASSETTO}=== EMPORIO DELLE TERRE DI CONFINE ==={RESET}")
     print(f"Acquirente: {CIANO}{eroe['nome']}{RESET} | Borsello attuale: {VERDE}{GRASSETTO}{eroe['mo']} MO{RESET}\n")
     for codice, nome_item, costo, _, _ in EMPORIO_ITEMS:
@@ -2325,13 +2358,13 @@ def apri_emporio(db: DnDDatabase, eroi_party: list, avventura: dict):
 
 
 def aggiorna_manuale_eroe(db: DnDDatabase, eroi_party: list):
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     print(f"{GIALLO}{GRASSETTO}=== AGGIORNAMENTO RAPIDO SCHEDA ==={RESET}")
     eroe = scegli_membro_party(eroi_party, "aggiornare la scheda")
     if not eroe:
         return
 
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     mostra_scheda(eroe)
     print(f"\n{GIALLO}Premi INVIO per lasciare invariato un campo, oppure 0 su Livello per annullare.{RESET}")
     liv = input(f"Livello attuale ({eroe['livello']}): ").strip()
@@ -2363,13 +2396,13 @@ def aggiorna_manuale_eroe(db: DnDDatabase, eroi_party: list):
 
 
 def gestisci_comando_livello(db: DnDDatabase, eroi_party: list, avventura: dict):
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     print(f"{CIANO}{GRASSETTO}=== PROGRESSIONE BECMI & ASCENSIONE IMMORTALE ==={RESET}")
     eroe = scegli_membro_party(eroi_party, "gestire livello / Immortalita")
     if not eroe:
         return
 
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     sincronizza_statistiche_becmi(eroe)
     mostra_scheda(eroe)
     avanzamenti = verifica_passaggio_livello(eroe)
@@ -2560,7 +2593,7 @@ class PDFCanvas:
             cmd.append("S")
         self.stream.append("\n".join(cmd))
 
-    def text(self, x, y, string, font="F1", size=10, color=(0, 0, 0)):
+    def text(self, x, y, string, font="F1", size: float = 10.0, color=(0, 0, 0)):
         clean = sanitize_pdf_text(str(string))
         safe_str = clean.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
         cmd = [
@@ -2791,7 +2824,7 @@ def estrai_dossier_stanze(righe_legenda):
     return stanze
 
 
-def esporta_mappa_pdf_a4(avventura: dict, eroi_party: list, testo_mappa: str = None, api_key: str = None) -> str:
+def esporta_mappa_pdf_a4(avventura: dict, eroi_party: list, testo_mappa: Optional[str] = None, api_key: Optional[str] = None) -> str:
     dir_mappe = MAPPE_DIR
     os.makedirs(dir_mappe, exist_ok=True)
     titolo_pulito = re.sub(r"[^\w\-_]", "_", avventura.get("titolo", "avventura")).strip("_")
@@ -2799,11 +2832,10 @@ def esporta_mappa_pdf_a4(avventura: dict, eroi_party: list, testo_mappa: str = N
     nome_file = f"mappa_{titolo_pulito}_{timestamp}_A4.pdf"
     percorso_completo = os.path.join(dir_mappe, nome_file)
 
+    if not testo_mappa and api_key:
+        testo_mappa = genera_mappa_ascii(avventura, api_key, eroi_party)
     if not testo_mappa:
-        if api_key:
-            testo_mappa = genera_mappa_ascii(avventura, api_key, eroi_party)
-        else:
-            testo_mappa = avventura.get("ultima_mappa_ascii", "+---+\n| 1 |\n+---+")
+        testo_mappa = str(avventura.get("ultima_mappa_ascii") or "+---+\n| 1 |\n+---+")
 
     avventura["ultima_mappa_ascii"] = testo_mappa
 
@@ -2988,7 +3020,7 @@ def esporta_scheda_pdf_a4(eroe: dict) -> str:
     ]
 
     ay = 675
-    for nome_attr, val, abbrev, nota in attrs:
+    for nome_attr, val, _, nota in attrs:
         mod = mod_caratteristica(val)
         mod_str = f"{mod:+d}"
         c.rect(42, ay - 5, 34, 28, fill=(0.92, 0.94, 0.97), stroke=(0.54, 0.0, 0.0), line_width=1.0)
@@ -3468,6 +3500,7 @@ def memorizza_incantesimo_eroe(db, eroe: dict):
 
 
 def gestisci_comando_lancia(db, eroi_party, avventura, azione):
+    _ = avventura
     parti = azione.split(maxsplit=1)
     nome_input = parti[1].strip().lower() if len(parti) > 1 else ""
 
@@ -3495,7 +3528,7 @@ def gestisci_comando_lancia(db, eroi_party, avventura, azione):
     if not inc_scelto:
         print(f"\n{CIANO}{GRASSETTO}Incantesimi preparati da {eroe['nome']}:{RESET}")
         for idx, inc in enumerate(prep, 1):
-            d = INCANTESIMI_DATABASE.get(inc, {})
+            d = INCANTESIMI_DATABASE.get(inc) or {}
             print(f"  {VERDE}[{idx}]{RESET} {GRASSETTO}{inc}{RESET} ({d.get('cerchio', 1)}° Cerchio) — {DIM}{d.get('desc', '')}{RESET}")
         scelta = input(f"\n{VERDE}Quale incantesimo vuoi lanciare? [1-{len(prep)}] > {RESET}").strip()
         if scelta.isdigit() and 1 <= int(scelta) <= len(prep):
@@ -3550,7 +3583,7 @@ def rileva_intento_torcia(testo: str):
     return None
 
 
-def rileva_ambiente_e_luce(testo_dm: str, azione: str = "", st_attuale: dict = None):
+def rileva_ambiente_e_luce(testo_dm: str, azione: str = "", st_attuale: Optional[dict] = None):
     st = st_attuale or {}
     blocco_manuale = st.get("ambiente_manuale", False)
     if blocco_manuale:
@@ -4152,7 +4185,7 @@ def ricevi_pacchetto_lan(f_obj):
 
 
 def avvia_host_lan(db: DnDDatabase, avventure: dict, personaggi: dict, api_key: str):
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     ip_lan = ottieni_ip_locale()
     print(f"{MAGENTA}{GRASSETTO}=== OSPITA PARTITA IN LAN (SERVER TCP) ==={RESET}")
     print(f"Indirizzo IP locale di questo PC: {VERDE}{GRASSETTO}{ip_lan}{RESET}")
@@ -4301,7 +4334,7 @@ def avvia_host_lan(db: DnDDatabase, avventure: dict, personaggi: dict, api_key: 
 
 
 def avvia_client_lan(host_ip_predefinito=""):
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_console()
     print(f"{MAGENTA}{GRASSETTO}=== UNISCITI A PARTITA IN LAN (CLIENT TCP) ==={RESET}")
     print(f"{DIM}Digita 0 in qualsiasi momento per tornare al Menu Principale.{RESET}\n")
 
@@ -4364,7 +4397,7 @@ def avvia_client_lan(host_ip_predefinito=""):
                 time.sleep(1.2)
                 break
 
-            os.system("clear" if os.name == "posix" else "cls")
+            clear_console()
             print(f"{MAGENTA}{GRASSETTO}=== CLIENT LAN ({host_ip}) ==={RESET} {GIALLO}{pkt.get('titolo', '')}{RESET} {DIM}| Eroe: {pg_scelto['nome']}{RESET}")
             print(f"{DIM}Digita /stop o /0 per disconnetterti e tornare al Menu Principale{RESET}\n")
             formatta_risposta(pkt.get("testo_dm", ""), animato=False)
@@ -4419,6 +4452,7 @@ def esegui_sessione(db: DnDDatabase, avventura: dict, personaggi: dict, api_key:
 
     pulisci_schermo(avventura, eroi_party)
 
+    prompt_init = ""
     if len(avventura["storia"]) <= 1:
         if not avventura["storia"]:
             prompt_init = f"Gruppo di avventurieri: {', '.join(party_nomi)}. {SCENARI_AVVENTURA['1'][1]}"
@@ -4435,7 +4469,7 @@ def esegui_sessione(db: DnDDatabase, avventura: dict, personaggi: dict, api_key:
             db.aggiungi_messaggio(avventura["id"], "model", testo_dm)
             aggiorna_party_da_riquadro(eroi_party, testo_dm)
             st_d = avventura.setdefault("stato_dungeon", {})
-            luce_amb, amb_nome, manuale = rileva_ambiente_e_luce(testo_dm, prompt_init if 'prompt_init' in locals() else '', st_d)
+            luce_amb, amb_nome, manuale = rileva_ambiente_e_luce(testo_dm, prompt_init, st_d)
             st_d["luce_ambientale"] = luce_amb
             st_d["ambiente_nome"] = amb_nome
             st_d["ambiente_manuale"] = manuale
@@ -4909,7 +4943,10 @@ def esegui_sessione(db: DnDDatabase, avventura: dict, personaggi: dict, api_key:
             print(f"{DIM}{testo_mostrato}{RESET}\n")
             try:
                 import termios
-                termios.tcflush(sys.stdin, termios.TCIFLUSH)
+                flush_input = getattr(termios, "tcflush", None)
+                input_queue = getattr(termios, "TCIFLUSH", None)
+                if flush_input is not None and input_queue is not None:
+                    flush_input(sys.stdin, input_queue)
             except Exception:
                 pass
             formatta_risposta(testo_dm, animato=True)
