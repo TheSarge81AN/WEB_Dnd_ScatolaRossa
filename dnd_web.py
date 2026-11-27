@@ -208,15 +208,16 @@ def execute_slash(adventure, party, action):
     lower = stripped.lower()
     eroi = party
 
-    if lower in ("/help", "/aiuto", "/help pdf", "/comandi pdf"):
+    if lower in ("/help", "/aiuto", "/comandi", "/help pdf", "/comandi pdf"):
         if lower in ("/help pdf", "/comandi pdf"):
             text, _ = capture_console(lambda: game.aggiorna_manuale_comandi_pdf(forza=True, silenzioso=False))
         else:
             text = game.HELP_TESTO
         return True, text
 
-    if lower.startswith("/inventario"):
-        name = stripped[len("/inventario"):].strip()
+    if lower.startswith(("/inventario", "/zaino", "/equip")):
+        command = lower.split(maxsplit=1)[0]
+        name = stripped[len(command):].strip()
         if name and name.lower() not in ("party", "tutti"):
             selected = next((e for e in eroi if e["nome"].lower() == name.lower()), None)
             text, _ = capture_console(lambda: game.mostra_inventario(selected) if selected else print("Personaggio non trovato."))
@@ -224,7 +225,7 @@ def execute_slash(adventure, party, action):
             text, _ = capture_console(lambda: game.mostra_inventario_party(eroi))
         return True, text
 
-    if lower in ("", "/magia"):
+    if lower in ("", "/magia", "/incantesimi", "/grimorio", "/spells"):
         text, _ = capture_console(lambda: game.mostra_grimorio_e_incantesimi(eroi[0]))
         return True, text
 
@@ -260,7 +261,7 @@ def execute_slash(adventure, party, action):
         text, _ = capture_console(lambda: game.gestisci_comando_riposo(DB, eroi, adventure))
         return True, text
 
-    if lower in ("/scheda pdf", "/schedapdf", "/esporta scheda"):
+    if lower in ("/scheda pdf", "/schedapdf"):
         text, _ = capture_console(lambda: print(game.esporta_scheda_pdf_a4(eroi[0])))
         return True, text
 
@@ -269,12 +270,19 @@ def execute_slash(adventure, party, action):
         return True, text
 
     if lower.startswith("/esporta"):
-        text, _ = capture_console(lambda: print(game.esporta_cronaca_avventura(DB, adventure, eroi)))
+        subcommand = lower[len("/esporta"):].strip()
+        if subcommand in ("mappa", "mappapdf"):
+            text, _ = capture_console(lambda: print(game.esporta_mappa_pdf_a4(adventure, eroi)))
+        elif subcommand in ("scheda", "schede", "schedapdf"):
+            text, _ = capture_console(lambda: [print(game.esporta_scheda_pdf_a4(hero)) for hero in eroi])
+        else:
+            text, _ = capture_console(lambda: print(game.esporta_cronaca_avventura(DB, adventure, eroi)))
         return True, text
 
-    if lower in ("/suoni", "/suoni test"):
-        sub = lower[len("/suoni"):].strip()
-        if sub == "test":
+    if lower in ("/suoni", "/suoni test", "/suoni prova", "/audio", "/audio test", "/audio prova"):
+        command = lower.split(maxsplit=1)[0]
+        sub = lower[len(command):].strip()
+        if sub in ("test", "prova"):
             text, _ = capture_console(game.testa_effetti_sonori)
         else:
             game.SUONI_ATTIVI = not game.SUONI_ATTIVI
@@ -313,7 +321,7 @@ def perform_action(adventure_id, action, user):
             slash, slash_output = execute_slash(adventure, party, action)
         if slash:
             clean_output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", slash_output)
-            return 200, {"ok": True, "output": clean_output, "adventure": adventure_view(adventure)}
+            return 200, {"ok": True, "output": clean_output, "slash": True, "adventure": adventure_view(adventure)}
 
         key = api_key_active()
         if not key:
@@ -440,13 +448,7 @@ class WebHandler(BaseHTTPRequestHandler):
             if not self.require_admin():
                 return
             try:
-                with LOCK:
-                    adventures = DB.carica_sommario_avventure()
-                json_response(self, 200, {
-                    "users": AUTH_STORE.list_users(),
-                    "api_key": api_key_status(),
-                    "adventures": adventures
-                })
+                json_response(self, 200, {"users": AUTH_STORE.list_users(), "api_key": api_key_status()})
             except (OSError, ValueError) as exc:
                 json_response(self, 500, {"error": str(exc)})
             return
@@ -532,28 +534,13 @@ class WebHandler(BaseHTTPRequestHandler):
                         return
                     json_response(self, 200, {"ok": True, "users": AUTH_STORE.list_users()})
                     return
-                if path == "/api/admin/delete-adventure":
-                    adventure_id = str(data.get("adventure_id", "")).strip()
-                    if not adventure_id:
-                        json_response(self, 400, {"error": "Seleziona un'avventura valida."})
-                        return
-                    with adventure_lock_for(adventure_id):
-                        with LOCK:
-                            if not any(adventure["id"] == adventure_id for adventure in DB.carica_sommario_avventure()):
-                                json_response(self, 404, {"error": "Avventura non trovata."})
-                                return
-                            DB.elimina_avventura(adventure_id)
-                            AUTH_STORE.remove_adventure(adventure_id)
-                    json_response(self, 200, {"ok": True})
-                    return
                 if path == "/api/admin/cleanup-adventures":
-                    adventure_ids = [adventure["id"] for adventure in DB.carica_sommario_avventure()]
-                    with ExitStack() as locks:
-                        for adventure_id in sorted(adventure_ids):
-                            locks.enter_context(adventure_lock_for(adventure_id))
-                        with LOCK:
-                            DB.elimina_avventure(adventure_ids)
-                            AUTH_STORE.remove_adventures(adventure_ids)
+                    adventure_ids = list(safe_adventures())
+                    for adventure_id in adventure_ids:
+                        with adventure_lock_for(adventure_id):
+                            with LOCK:
+                                DB.elimina_avventura(adventure_id)
+                                AUTH_STORE.remove_adventure(adventure_id)
                     json_response(self, 200, {"ok": True, "deleted": len(adventure_ids)})
                     return
                 if path == "/api/admin/api-key":
@@ -588,7 +575,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 with LOCK:
                     characters = safe_characters()
                     character_name = next((name for name in characters if name.casefold() == requested_name.casefold()), None)
-                    adventures = DB.carica_metadati_avventure()
+                    adventures = safe_adventures()
                     affected_ids = [
                         adventure_id for adventure_id, adventure in adventures.items()
                         if any(name.casefold() == requested_name.casefold() for name in (adventure.get("party") or [adventure.get("eroe", "")]))
@@ -600,7 +587,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     for adventure_id in sorted(affected_ids):
                         locks.enter_context(adventure_lock_for(adventure_id))
                     with LOCK:
-                        adventures = DB.carica_metadati_avventure()
+                        adventures = safe_adventures()
                         current_ids = [
                             adventure_id for adventure_id, adventure in adventures.items()
                             if any(name.casefold() == character_name.casefold() for name in (adventure.get("party") or [adventure.get("eroe", "")]))
@@ -619,21 +606,25 @@ class WebHandler(BaseHTTPRequestHandler):
                             updated_parties[adventure_id] = remaining
                         owned_names = {name.casefold() for name in AUTH_STORE.character_names(user["id"])}
                         owned_names.discard(character_name.casefold())
-                        member_replacements = {}
                         for adventure_id, party_names in updated_parties.items():
                             adventure = adventures[adventure_id]
                             adventure["party"] = party_names
                             adventure["eroe"] = party_names[0]
-                            member_replacements[adventure_id] = next((
-                                name for name in party_names
-                                if name.casefold() in owned_names
-                                and name in characters
-                                and not characters[name].get("deceduto")
-                                and characters[name]["pf_attuali"] > 0
-                            ), None)
-                        DB.salva_metadati_avventure([adventures[adventure_id] for adventure_id in updated_parties])
+                            DB.salva_metadati_avventura(adventure)
+                            if AUTH_STORE.is_member(user["id"], adventure_id):
+                                replacement = next((
+                                    name for name in party_names
+                                    if name.casefold() in owned_names
+                                    and name in characters
+                                    and not characters[name].get("deceduto")
+                                    and characters[name]["pf_attuali"] > 0
+                                ), None)
+                                if replacement:
+                                    AUTH_STORE.set_member_character(user["id"], adventure_id, replacement)
+                                else:
+                                    AUTH_STORE.remove_member(user["id"], adventure_id)
                         DB.elimina_personaggio(character_name)
-                        AUTH_STORE.update_character_adventures(user["id"], member_replacements, character_name)
+                        AUTH_STORE.release_character(user["id"], character_name)
                 json_response(self, 200, {"ok": True, "character": character_name})
                 return
 
@@ -890,6 +881,7 @@ PAGE = r"""<!doctype html>
     }
     * { box-sizing:border-box; }
     body { margin:0; background:var(--app-bg); color:var(--ink); font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; transition:background-color .2s ease,color .2s ease; }
+    #gameView { display:flex; flex-direction:column; width:100%; height:100vh; height:100dvh; min-height:0; overflow:hidden; }
     #gameView[hidden], #loginView[hidden], #adminView[hidden], #cemeteryView[hidden] { display:none; }
     .login-view { min-height:100vh; display:grid; place-items:center; padding:20px; background:radial-gradient(ellipse at top,var(--red),var(--app-bg) 70%); }
     .login-card { width:min(440px,100%); padding:32px; background:var(--paper); border:1px solid var(--gold); border-radius:18px; box-shadow:0 24px 64px #0005; }
@@ -919,7 +911,7 @@ PAGE = r"""<!doctype html>
     .database-saving-indicator svg { width:24px; height:24px; }
     @keyframes database-saving-pulse { to { transform:scale(1.12); } }
     @media (prefers-reduced-motion: reduce) { .busy-indicator[aria-hidden="false"], .database-saving-indicator[aria-hidden="false"] { animation:none; } }
-    main { height:calc(100vh - 64px); display:grid; grid-template-columns:292px minmax(0, 1fr); }
+    main { flex:1; min-height:0; height:auto; display:grid; grid-template-columns:292px minmax(0, 1fr); }
     aside, section { min-height:0; }
     aside { background:var(--paper); border-right:1px solid var(--line); overflow:auto; padding:16px; }
     #sidebarToggle { display:none; }
@@ -952,8 +944,10 @@ PAGE = r"""<!doctype html>
     .story-pagination button { min-width:90px; }
     .composer { border-top:1px solid var(--line); background:var(--composer-bg); padding:14px 18px; }
     .composer-row { display:flex; gap:10px; }
+    .composer-row textarea { flex:1; min-width:0; }
     .composer textarea { resize:vertical; min-height:50px; max-height:180px; }
     .composer button { min-width:92px; }
+    #commandsBtn { min-width:84px; }
     #output { min-height:30px; padding:8px 12px 0; color:var(--red); font-size:13px; }
     .hero { border-bottom:1px dashed var(--line); padding:9px 0; }
     .hero strong { color:var(--red); }
@@ -961,15 +955,13 @@ PAGE = r"""<!doctype html>
     .inventory-button { position:relative; z-index:32; display:grid; place-items:center; width:32px; height:30px; padding:3px; background:var(--red); border-color:#6f1115; }
     .inventory-button svg { display:block; width:21px; height:21px; }
     .party-title { color:var(--red); font-weight:bold; margin-bottom:6px; }
-    .command-help summary { color:var(--red); font-weight:bold; cursor:pointer; }
-    .command-help ul { list-style:none; margin:9px 0 0; padding:0; }
-    .command-help li { display:block; padding:6px 0; border-bottom:1px dashed #d5cba8; font-size:12px; }
-    .command-shortcut { display:block; margin-bottom:4px; padding:3px 5px; font-family:monospace; font-size:11px; }
+    .command-help-list { list-style:none; margin:0; padding:0; }
+    .command-help-list li { display:block; padding:8px 0; border-bottom:1px dashed #d5cba8; font-size:12px; }
+    .command-shortcut { display:block; margin-bottom:4px; padding:5px 8px; font-family:monospace; font-size:12px; }
     #inventoryBackdrop { position:fixed; z-index:29; inset:0; background:#0008; opacity:0; pointer-events:none; transition:opacity .22s ease; }
     #inventoryPanel { position:fixed; z-index:30; left:50%; bottom:0; width:min(720px,calc(100vw - 24px)); max-height:min(65vh,600px); overflow:auto; padding:18px; background:var(--paper); border:1px solid var(--panel-border); border-bottom:0; border-radius:18px 18px 0 0; box-shadow:0 -8px 28px #0005; transform:translate(-50%,calc(100% + 24px)); transition:transform .24s ease; }
     body.inventory-open #inventoryBackdrop { opacity:1; pointer-events:auto; }
     body.inventory-open #inventoryPanel { transform:translate(-50%,0); }
-    body.inventory-open #sidebar { z-index:31; }
     .inventory-panel-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
     .inventory-panel-heading h2 { margin:0; color:var(--red); font-size:18px; }
     #inventoryClose { width:36px; padding:4px; font-size:20px; line-height:1; }
@@ -977,7 +969,7 @@ PAGE = r"""<!doctype html>
     .muted { color:var(--muted); font-size:12px; }
     .grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
     #adminView main.admin-main { height:auto; min-height:calc(100vh - 64px); display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); align-content:start; gap:16px; padding:20px; }
-    #cemeteryView main.cemetery-main { height:calc(100vh - 64px); display:block; overflow:auto; padding:clamp(16px,4vw,36px); }
+    #cemeteryView main.cemetery-main { flex:none; height:calc(100vh - 64px); height:calc(100dvh - 64px); display:block; overflow:auto; padding:clamp(16px,4vw,36px); }
     .cemetery-heading { max-width:1100px; margin:0 auto 18px; }
     .cemetery-heading h2 { margin:0 0 6px; color:var(--red); }
     .cemetery-grid { max-width:1100px; margin:0 auto; display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:14px; }
@@ -998,14 +990,15 @@ PAGE = r"""<!doctype html>
     }
     @media (max-width:700px) {
       header { justify-content:space-between; gap:8px; padding:8px 12px; }
-      header h1 { font-size:16px; }
+      header h1 { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:16px; }
       header .status, .palette-control label { display:none; }
-      .header-actions { gap:6px; }
-      .palette-control select { min-width:0; max-width:112px; padding:7px 22px 7px 7px; font-size:12px; }
+      .header-actions { flex:0 0 auto; gap:6px; }
+      .header-actions button { min-width:0; padding:7px 9px; }
+      .palette-control select { min-width:0; max-width:84px; padding:7px 20px 7px 7px; font-size:12px; }
       #sidebarToggle { display:inline-flex; align-items:center; justify-content:center; min-width:40px; }
-      main { display:block; height:calc(100vh - 64px); }
+      main { display:flex; flex-direction:column; height:auto; }
       #adminView main.admin-main { display:block; height:auto; }
-      #cemeteryView main.cemetery-main { height:calc(100vh - 64px); }
+      #cemeteryView main.cemetery-main { height:calc(100vh - 64px); height:calc(100dvh - 64px); }
       #sidebar {
         position:fixed; z-index:20; top:64px; bottom:0; left:0;
         width:min(86vw, 320px); border-right:1px solid var(--line);
@@ -1018,9 +1011,13 @@ PAGE = r"""<!doctype html>
         background:#0008;
       }
       body.sidebar-open #sidebarBackdrop { display:block; }
-      .chat { height:calc(100vh - 64px); }
+      .chat { flex:1; height:auto; min-height:0; }
       #messages { padding:14px 12px; }
       .composer { padding:10px; }
+      .composer-row { gap:6px; }
+      .composer button { min-width:72px; padding:8px; }
+      #commandsBtn { min-width:68px; }
+      #inventoryPanel { max-height:min(70dvh,600px); padding:16px 14px max(16px,env(safe-area-inset-bottom)); }
     }
   </style>
 </head>
@@ -1042,7 +1039,7 @@ PAGE = r"""<!doctype html>
 <header>
   <button id="sidebarToggle" type="button" aria-label="Apri il menu" aria-expanded="false">☰</button>
   <h1>D&amp;D - Scatola Rossa</h1>
-  <div class="header-actions"><span id="busyIndicator" class="busy-indicator" role="status" aria-label="Elaborazione in corso" aria-hidden="true" title="Elaborazione in corso" hidden>⌛</span><div class="status" id="status">Caricamento...</div><span id="currentUser" class="status"></span><div class="palette-control"><label for="gamePalette">Palette</label><select class="palette-select" id="gamePalette" aria-label="Scegli la palette colori"><option value="red">Scatola Rossa</option><option value="forest">Foresta</option><option value="arcane">Arcano</option><option value="midnight">Notte</option></select></div><button id="cemeteryBtn" class="secondary" type="button">Cimitero degli Eroi</button><button id="adminBtn" class="secondary" type="button" hidden>Amministrazione</button><button id="logoutBtn" class="secondary" type="button">Esci</button></div>
+  <div class="header-actions"><span id="busyIndicator" class="busy-indicator" role="status" aria-label="Elaborazione in corso" aria-hidden="true" title="Elaborazione in corso" hidden>⌛</span><div class="status" id="status">Caricamento...</div><span id="currentUser" class="status"></span><div class="palette-control"><label for="gamePalette">Palette</label><select class="palette-select" id="gamePalette" aria-label="Scegli la palette colori"><option value="red">Scatola Rossa</option><option value="forest">Foresta</option><option value="arcane">Arcano</option><option value="midnight">Notte</option></select></div><button id="adminBtn" class="secondary" type="button" hidden>Amministrazione</button><button id="logoutBtn" class="secondary" type="button">Esci</button></div>
 </header>
 <div id="sidebarBackdrop"></div>
 <div id="inventoryBackdrop"></div>
@@ -1063,10 +1060,7 @@ PAGE = r"""<!doctype html>
       <div id="characterList"></div>
       <button class="secondary" style="width:100%;margin-top:8px" id="newCharBtn">Nuovo personaggio</button>
     </div>
-    <details class="panel command-help">
-      <summary>Comandi disponibili</summary>
-      <ul id="commandList"></ul>
-    </details>
+    <button id="cemeteryBtn" class="secondary" type="button" style="width:100%">Cimitero degli Eroi</button>
   </aside>
   <section class="chat">
     <div id="messages"></div>
@@ -1079,6 +1073,7 @@ PAGE = r"""<!doctype html>
     <div class="composer">
       <div class="composer-row">
         <textarea id="action" placeholder="Descrivi l'azione oppure usa un comando, ad esempio /inventario"></textarea>
+        <button id="commandsBtn" class="secondary" type="button" aria-label="Mostra i comandi disponibili">Comandi</button>
         <button id="sendBtn">Invia</button>
       </div>
     </div>
@@ -1087,8 +1082,8 @@ PAGE = r"""<!doctype html>
 
 <section id="inventoryPanel" role="dialog" aria-modal="true" aria-labelledby="inventoryTitle" aria-hidden="true">
   <div class="inventory-panel-heading">
-    <h2 id="inventoryTitle">Inventario</h2>
-    <button id="inventoryClose" type="button" aria-label="Chiudi inventario">×</button>
+    <h2 id="inventoryTitle">Risultato</h2>
+    <button id="inventoryClose" type="button" aria-label="Chiudi pannello">×</button>
   </div>
   <div id="inventoryContent"></div>
 </section>
@@ -1155,9 +1150,7 @@ PAGE = r"""<!doctype html>
     </section>
     <section class="panel">
       <h2>Manutenzione avventure</h2>
-      <p class="muted">Elimina una singola avventura oppure tutte le avventure dal database, comprese quelle iniziali o prive di proprietario.</p>
-      <div id="adminAdventures" style="display:grid;gap:8px;margin-bottom:12px"></div>
-      <p id="adminAdventureMessage" class="admin-key-status" role="status"></p>
+      <p class="muted">Elimina tutte le avventure dal database, comprese quelle iniziali o prive di proprietario.</p>
       <button id="cleanupAdventuresBtn" class="danger" type="button">Pulisci tutte le avventure</button>
       <p id="cleanupAdventuresMessage" class="admin-key-status" role="status"></p>
     </section>
@@ -1182,13 +1175,13 @@ PAGE = r"""<!doctype html>
     <div id="cemeteryList" class="cemetery-grid"></div>
   </main>
 </section>
-<span id="databaseSavingIndicator" class="database-saving-indicator" role="status" aria-label="Salvataggio sul database in corso" aria-live="polite" aria-hidden="true" title="Salvataggio sul database in corso" hidden><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><ellipse cx="12" cy="5" rx="8" ry="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></span>
+<span id="databaseSavingIndicator" class="database-saving-indicator" role="status" aria-label="Caricamento o salvataggio dei dati sul database in corso" aria-live="polite" aria-hidden="true" title="Caricamento o salvataggio dei dati sul database in corso" hidden><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><ellipse cx="12" cy="5" rx="8" ry="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></span>
 
 <script>
 let state = null;
 let activeId = null;
 let processingOperations = 0;
-let databaseSavingOperations = 0;
+let databaseActivityOperations = 0;
 const PALETTE_NAMES = new Set(['red', 'forest', 'arcane', 'midnight']);
 
 function applyPalette(palette, persist = true) {
@@ -1224,18 +1217,23 @@ function setProcessing(active) {
   indicator.setAttribute('aria-hidden', String(indicator.hidden));
 }
 
-function setDatabaseSaving(active) {
-  databaseSavingOperations = Math.max(0, databaseSavingOperations + (active ? 1 : -1));
+function setDatabaseActivity(active) {
+  databaseActivityOperations = Math.max(0, databaseActivityOperations + (active ? 1 : -1));
   const indicator = document.getElementById('databaseSavingIndicator');
-  indicator.hidden = databaseSavingOperations === 0;
+  indicator.hidden = databaseActivityOperations === 0;
   indicator.setAttribute('aria-hidden', String(indicator.hidden));
 }
 
 const WEB_COMMANDS = [
   {label:'/help', value:'/help', description:'Mostra la guida rapida.'},
+  {label:'/aiuto', value:'/aiuto', description:'Alias di /help.'},
   {label:'/help pdf', value:'/help pdf', description:'Genera il manuale comandi PDF.'},
-  {label:'/inventario', value:'/inventario', description:'Mostra l’inventario del party.'},
-  {label:'/magia', value:'/magia', description:'Mostra grimorio e slot.'},
+  {label:'/comandi pdf', value:'/comandi pdf', description:'Alias per generare il manuale comandi PDF.'},
+  {label:'/inventario [nome|party]', value:'/inventario ', description:'Mostra l’inventario di un personaggio o del party.'},
+  {label:'/zaino [nome|party]', value:'/zaino ', description:'Alias di /inventario.'},
+  {label:'/magia', value:'/magia', spellCommand:true, description:'Mostra grimorio e slot.'},
+  {label:'/incantesimi', value:'/incantesimi', spellCommand:true, description:'Mostra grimorio e slot (comando per Chierici).'},
+  {label:'/grimorio', value:'/grimorio', description:'Alias per visualizzare grimorio e slot.'},
   {label:'/torcia [on|off|auto]', value:'/torcia ', description:'Gestisce torce; completa con on, off o auto.'},
   {label:'/ambiente [tipo]', value:'/ambiente ', description:'Imposta taverna, citta, dungeon o auto.'},
   {label:'/incontri [frequenza]', value:'/incontri ', description:'Usa raro, normale, frequente oppure off.'},
@@ -1243,7 +1241,10 @@ const WEB_COMMANDS = [
   {label:'/scheda pdf', value:'/scheda pdf', description:'Esporta la scheda del primo eroe del party.'},
   {label:'/mappa pdf', value:'/mappa pdf', description:'Esporta la mappa tattica PDF.'},
   {label:'/esporta', value:'/esporta', description:'Esporta la cronaca della campagna.'},
-  {label:'/suoni [test]', value:'/suoni ', description:'Attiva/disattiva gli effetti o prova i suoni.'}
+  {label:'/esporta mappa', value:'/esporta mappa', description:'Esporta la mappa tattica PDF.'},
+  {label:'/esporta scheda', value:'/esporta scheda', description:'Esporta le schede PDF del party.'},
+  {label:'/suoni [test|prova]', value:'/suoni ', description:'Attiva/disattiva gli effetti o prova i suoni.'},
+  {label:'/audio [test|prova]', value:'/audio ', description:'Alias di /suoni.'}
 ];
 
 function closeSidebar() {
@@ -1254,9 +1255,47 @@ function closeSidebar() {
 let activeInventoryName = null;
 
 function openDrawer(title, content) {
+  closeSidebar();
   activeInventoryName = null;
   document.getElementById('inventoryTitle').textContent = title;
-  document.getElementById('inventoryContent').textContent = content;
+  document.getElementById('inventoryContent').replaceChildren(document.createTextNode(content));
+  document.body.classList.add('inventory-open');
+  document.getElementById('inventoryPanel').setAttribute('aria-hidden', 'false');
+}
+
+function openCommandsDrawer() {
+  closeSidebar();
+  const content = document.getElementById('inventoryContent');
+  content.replaceChildren();
+  const adventure = state?.adventures.find(item => item.id === activeId);
+  const firstCharacterName = adventure?.party?.[0];
+  const firstCharacter = state?.characters.find(character => character.nome === firstCharacterName);
+  const isCleric = firstCharacter?.classe?.toLowerCase() === 'chierico';
+  const spellCommand = isCleric ? '/incantesimi' : '/magia';
+  const list = document.createElement('ul');
+  list.className = 'command-help-list';
+  WEB_COMMANDS.forEach(command => {
+    if (command.spellCommand && command.value !== spellCommand) return;
+    const item = document.createElement('li');
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'command-shortcut';
+    button.textContent = command.label;
+    button.title = 'Inserisci ' + command.label;
+    button.onclick = () => {
+      const input = document.getElementById('action');
+      input.value = command.value;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+      closeInventory();
+    };
+    const description = document.createElement('span');
+    description.textContent = command.description;
+    item.append(button, description);
+    list.appendChild(item);
+  });
+  content.appendChild(list);
+  document.getElementById('inventoryTitle').textContent = 'Comandi disponibili';
   document.body.classList.add('inventory-open');
   document.getElementById('inventoryPanel').setAttribute('aria-hidden', 'false');
 }
@@ -1281,41 +1320,17 @@ document.addEventListener('keydown', event => {
   }
 });
 
-function renderCommandList() {
-  const list = document.getElementById('commandList');
-  WEB_COMMANDS.forEach(command => {
-    const item = document.createElement('li');
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'command-shortcut';
-    button.textContent = command.label;
-    button.title = 'Inserisci ' + command.label;
-    button.onclick = () => {
-      const input = document.getElementById('action');
-      input.value = command.value;
-      input.focus();
-      input.setSelectionRange(input.value.length, input.value.length);
-      closeSidebar();
-    };
-    const description = document.createElement('span');
-    description.textContent = command.description;
-    item.append(button, description);
-    list.appendChild(item);
-  });
-}
+document.getElementById('commandsBtn').onclick = openCommandsDrawer;
 
-renderCommandList();
-
-async function api(url, data) {
-  const savesData = Boolean(data);
-  if (savesData) setDatabaseSaving(true);
+async function api(url, data, trackDatabaseActivity = Boolean(data)) {
+  if (trackDatabaseActivity) setDatabaseActivity(true);
   try {
     const res = await fetch(url, data ? {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)} : {});
     const json = await res.json();
     if (!res.ok) throw new Error(json.error || 'Errore');
     return json;
   } finally {
-    if (savesData) setDatabaseSaving(false);
+    if (trackDatabaseActivity) setDatabaseActivity(false);
   }
 }
 
@@ -1400,11 +1415,15 @@ async function openAdmin() {
 }
 
 async function loadAdmin() {
+  const list = document.getElementById('adminUsers');
+  list.textContent = 'Caricamento account...';
+  document.getElementById('adminApiKeyStatus').textContent = 'Caricamento stato chiave API...';
+  setDatabaseActivity(true);
   try {
     const result = await api('/api/admin');
-    const list = document.getElementById('adminUsers');
     list.replaceChildren();
-    result.users.forEach(username => {
+    let rows = document.createDocumentFragment();
+    for (const [index, username] of result.users.entries()) {
       const row = document.createElement('div');
       row.className = 'admin-user-row';
       const name = document.createElement('strong');
@@ -1437,50 +1456,23 @@ async function loadAdmin() {
         } catch(e) { document.getElementById('adminUserMessage').textContent = e.message; }
       };
       row.append(name, password, update, remove);
-      list.append(row);
-    });
+      rows.append(row);
+      if ((index + 1) % 40 === 0) {
+        list.append(rows);
+        rows = document.createDocumentFragment();
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
+    list.append(rows);
     const key = result.api_key;
     document.getElementById('adminApiKeyStatus').textContent = key.configured
       ? `Configurata (${key.source}): ${key.masked}` : 'Nessuna chiave Gemini configurata.';
-    renderAdminAdventures(result.adventures);
   } catch(e) {
+    list.replaceChildren();
     document.getElementById('adminApiKeyMessage').textContent = e.message;
+  } finally {
+    setDatabaseActivity(false);
   }
-}
-
-function renderAdminAdventures(adventures) {
-  const list = document.getElementById('adminAdventures');
-  list.replaceChildren();
-  if (!adventures.length) {
-    list.textContent = 'Nessuna avventura presente.';
-    return;
-  }
-  adventures.forEach(adventure => {
-    const row = document.createElement('div');
-    row.className = 'admin-user-row';
-    const title = document.createElement('span');
-    title.textContent = `${adventure.titolo} (${adventure.data || 'data non disponibile'})`;
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'danger';
-    remove.textContent = 'Elimina';
-    remove.onclick = async () => {
-      if (!confirm(`Eliminare definitivamente l'avventura "${adventure.titolo}"? Questa operazione non si può annullare.`)) return;
-      remove.disabled = true;
-      const message = document.getElementById('adminAdventureMessage');
-      try {
-        await api('/api/admin/delete-adventure', {adventure_id:adventure.id});
-        if (activeId === adventure.id) activeId = null;
-        message.textContent = `Avventura "${adventure.titolo}" eliminata.`;
-        await loadAdmin();
-      } catch(e) {
-        message.textContent = e.message;
-        remove.disabled = false;
-      }
-    };
-    row.append(title, remove);
-    list.append(row);
-  });
 }
 
 document.getElementById('adminUserForm').onsubmit = async event => {
@@ -1518,8 +1510,7 @@ document.getElementById('cleanupAdventuresBtn').onclick = async () => {
   try {
     const result = await api('/api/admin/cleanup-adventures', {});
     message.textContent = `Eliminate ${result.deleted} avventure.`;
-    if (result.deleted && state?.adventures.some(adventure => adventure.id === activeId)) activeId = null;
-    await loadAdmin();
+    await refresh();
   } catch(e) { message.textContent = e.message; }
   finally { button.disabled = false; }
 };
@@ -1961,9 +1952,9 @@ async function sendAction() {
   try {
     const result = await api('/api/action',{adventure_id:activeId,action});
     actionInput.value = '';
-    document.getElementById('output').textContent = result.output || '';
+    document.getElementById('output').textContent = '';
     await refresh();
-    if (action.startsWith('/') && typeof result.output === 'string') {
+    if (result.slash === true && typeof result.output === 'string') {
       const command = action.trim().split(/\s+/, 1)[0];
       openDrawer(`Risultato ${command}`, result.output || 'Nessun contenuto da mostrare.');
     }

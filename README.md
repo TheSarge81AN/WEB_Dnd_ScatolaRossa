@@ -84,13 +84,13 @@ L'interfaccia web sostituisce il menu e gli input della console per le operazion
 - sidebar con riepilogo partita, richiudibile su schermi mobili;
 - pulsante zaino per consultare l'inventario dei membri del party e helper dei comandi web; i risultati dei comandi slash sono mostrati nel drawer;
 - pagina Cimitero degli Eroi con personaggi a 0 PF o contrassegnati come deceduti, indicazione dell'avventura in cui sono caduti, non selezionabili per nuove avventure o per unirsi a sessioni;
-- gestione amministrativa per eliminare una singola avventura o tutte le avventure, comprese quelle iniziali o senza proprietario, previa conferma;
+- comando amministrativo per eliminare tutte le avventure, comprese quelle iniziali o senza proprietario, previa conferma;
 - scelta dei moduli in `moduli_pdf/`;
 - invio delle azioni al DM;
 - consultazione della cronaca, automaticamente suddivisa in pagine da circa 60 righe quando è lunga;
 - icona dei dadi in fondo alle richieste di tiro del Master, con apertura in popup.
 
-I comandi `/...` possono essere inviati dalla casella azione della pagina; i relativi risultati vengono aperti nel drawer, come l'inventario. I personaggi con PF attuali pari o inferiori a zero vengono storicizzati come deceduti e mostrati nel Cimitero; non possono più giocare né essere selezionati per avviare o unirsi a un'avventura. Dalla pagina Amministrazione è possibile eliminare una singola avventura o tutte le avventure con un'azione esplicita e irreversibile. In modalità locale il file utenti viene inizializzato con `{"users": []}` e aggiornato dal pannello; in modalità PostgreSQL i dati account sono memorizzati nella tabella `web_users`. In entrambi i casi sono conservati salt e hash scrypt, mai password in chiaro. Crea o reimposta le password dal pannello amministrativo.
+I comandi `/...` possono essere inviati dalla casella azione della pagina; i relativi risultati vengono aperti nel drawer, come l'inventario. I personaggi con PF attuali pari o inferiori a zero vengono storicizzati come deceduti e mostrati nel Cimitero; non possono più giocare né essere selezionati per avviare o unirsi a un'avventura. Dalla pagina Amministrazione è possibile eliminare tutte le avventure con un'azione esplicita e irreversibile. In modalità locale il file utenti viene inizializzato con `{"users": []}` e aggiornato dal pannello; in modalità PostgreSQL i dati account sono memorizzati nella tabella `web_users`. In entrambi i casi sono conservati salt e hash scrypt, mai password in chiaro. Crea o reimposta le password dal pannello amministrativo.
 
 ### Pubblicazione su Render
 

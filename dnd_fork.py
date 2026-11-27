@@ -410,26 +410,16 @@ class DnDDatabase:
         return personaggi
 
     def salva_metadati_avventura(self, adv: dict):
-        self.salva_metadati_avventure([adv])
-
-    def salva_metadati_avventure(self, avventure: list[dict]):
-        rows = []
-        for adv in avventure:
-            party_list = adv.get("party") or [adv.get("eroe", "Valen di Corvobianco")]
-            st_dungeon = adv.get("stato_dungeon") or {
-                "torcia_turni": adv.get("torcia_turni_rimasti", 6),
-                "torcia_attiva": adv.get("torcia_attiva", True)
-            }
-            rows.append((
-                adv["id"], adv["titolo"], party_list[0], json.dumps(party_list, ensure_ascii=False),
-                adv.get("data", datetime.now().strftime("%d/%m/%Y %H:%M")),
-                adv.get("modulo_pdf", ""), adv.get("modulo_testo", ""),
-                json.dumps(st_dungeon, ensure_ascii=False)
-            ))
-        if not rows:
-            return
+        party_list = adv.get("party") or [adv.get("eroe", "Valen di Corvobianco")]
+        party_str = json.dumps(party_list, ensure_ascii=False)
+        eroe_principale = party_list[0]
+        st_dungeon = adv.get("stato_dungeon") or {
+            "torcia_turni": adv.get("torcia_turni_rimasti", 6),
+            "torcia_attiva": adv.get("torcia_attiva", True)
+        }
+        st_dungeon_str = json.dumps(st_dungeon, ensure_ascii=False)
         with self.conn:
-            self.conn.executemany("""
+            self.conn.execute("""
                 INSERT INTO avventure (id, titolo, eroe_nome, party_json, data_aggiornamento, modulo_pdf, modulo_testo, stato_dungeon_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
@@ -440,7 +430,12 @@ class DnDDatabase:
                     modulo_pdf = excluded.modulo_pdf,
                     modulo_testo = excluded.modulo_testo,
                     stato_dungeon_json = excluded.stato_dungeon_json
-            """, rows)
+            """, (
+                adv["id"], adv["titolo"], eroe_principale, party_str,
+                adv.get("data", datetime.now().strftime("%d/%m/%Y %H:%M")),
+                adv.get("modulo_pdf", ""), adv.get("modulo_testo", ""),
+                st_dungeon_str
+            ))
 
     def aggiungi_messaggio(self, avventura_id: str, ruolo: str, testo: str):
         if not testo or not testo.strip():
@@ -491,50 +486,8 @@ class DnDDatabase:
         return "\n".join(righe) + ("\n" if righe else "")
 
     def elimina_avventura(self, avventura_id: str):
-        self.elimina_avventure([avventura_id])
-
-    def elimina_avventure(self, avventura_ids: list[str]):
-        if not avventura_ids:
-            return
         with self.conn:
-            self.conn.executemany(
-                "DELETE FROM avventure WHERE id = ?",
-                [(avventura_id,) for avventura_id in avventura_ids]
-            )
-
-    def carica_sommario_avventure(self) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT id, titolo, data_aggiornamento FROM avventure ORDER BY id ASC"
-        ).fetchall()
-        return [dict(row) for row in rows]
-
-    def carica_metadati_avventure(self) -> dict:
-        rows = self.conn.execute("SELECT * FROM avventure ORDER BY id ASC").fetchall()
-        avventure = {}
-        for row in rows:
-            try:
-                party = json.loads(row["party_json"] or "[]")
-            except Exception:
-                party = []
-            if not party:
-                party = [row["eroe_nome"]]
-            try:
-                stato_dungeon = json.loads(row["stato_dungeon_json"] or "{}")
-            except Exception:
-                stato_dungeon = {}
-            avventure[row["id"]] = {
-                "id": row["id"],
-                "titolo": row["titolo"],
-                "eroe": party[0],
-                "party": party,
-                "data": row["data_aggiornamento"],
-                "modulo_pdf": row["modulo_pdf"] or "",
-                "modulo_testo": row["modulo_testo"] or "",
-                "stato_dungeon": stato_dungeon,
-                "torcia_turni_rimasti": stato_dungeon.get("torcia_turni", 6),
-                "torcia_attiva": stato_dungeon.get("torcia_attiva", True)
-            }
-        return avventure
+            self.conn.execute("DELETE FROM avventure WHERE id = ?", (avventura_id,))
 
     def carica_tutte_avventure(self) -> dict:
         avventure = {}
@@ -970,7 +923,7 @@ HELP_TESTO = f"""{CIANO}{GRASSETTO}=== GUIDA AI COMANDI - D&D SCATOLA ROSSA (v9.
   {VERDE}/nota <testo>{RESET}            Salva un appunto nel diario SQLite (/nota per leggere).
 
 {GIALLO}Magia, Sopravvivenza e Riposo:{RESET}
-  {VERDE}/magia{RESET} (o /incantesimi)  Mostra slot incantesimi e grimorio (Mago, Elfo, Chierico, Druido).
+  {VERDE}/magia{RESET} o {VERDE}/incantesimi{RESET}  Mostra slot e grimorio (Chierici: /incantesimi).
   {VERDE}/lancia <nome>{RESET} (o /cast) Lancia un incantesimo memorizzato consumando lo slot del cerchio.
   {VERDE}/riposo{RESET} (o /accampamento)Riposo breve (10m) o lungo (8h per recuperare 1d3 PF e tutti gli slot).
   {VERDE}/torcia{RESET} [on|off|auto]    Accende, spegne/riponi nello zaino o gestisce scorte (anche: "spegni torcia").
@@ -3293,7 +3246,7 @@ def aggiorna_manuale_comandi_pdf(forza: bool = False, silenzioso: bool = False) 
 
     p1.text(45, 347, "Classi Incantatrici: Maghi, Elfi (Magia Arcana) e Chierici, Druidi, Paladini (Magia Divina).", "F2", 8.5, (0.1, 0.1, 0.1))
     p1.text(45, 333, "Compendio BECMI Ufficiale: 36 incantesimi registrati per i Cerchi 1, 2 e 3 con descrizioni originali.", "F1", 8, (0.3, 0.3, 0.3))
-    p1.text(45, 319, "/magia (o /incantesimi) : Apre il grimorio, mostra gli slot disponibili per cerchio e gli incantesimi memorizzati.", "F2", 8.5, (0.54, 0, 0))
+    p1.text(45, 319, "/magia o /incantesimi (Chierici): Apre il grimorio e mostra slot e incantesimi memorizzati.", "F2", 8.5, (0.54, 0, 0))
     p1.text(45, 305, "/magia memorizza        : Seleziona e prepara nuovi incantesimi dagli slot liberi della giornata.", "F1", 8, (0.3, 0.3, 0.3))
     p1.text(45, 291, "/lancia <nome> (o /cast): Lancia un incantesimo preparato (es. '/lancia dardo incantato' o '/lancia cura').", "F2", 8.5, (0.54, 0, 0))
     p1.text(45, 277, "   - Verifica automatica dello slot disponibile del cerchio corrispondente.", "F1", 8, (0.3, 0.3, 0.3))
